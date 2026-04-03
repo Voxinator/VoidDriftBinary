@@ -227,6 +227,15 @@
 
 <script>
 var EMBED_MODE = false;
+var GAME_VERSION = '0.3.3';
+var XP_THRESHOLDS = [30, 50, 80, 110, 150, 200, 260, 330, 420];
+var LEVEL_NAMES = ['Scout','Gunner','Ace','Vanguard','Striker','Predator','Warden','Tempest','Sovereign','Void Walker'];
+var _levelUpText = '';
+var _levelUpTimer = 0;
+var _levelUpColor = '#FFFFFF';
+var _deathStats = null;
+var _deathStatsTimer = 0;
+var _scorePopups = [];
 var WORLD_W = 1920;
 var WORLD_H = 1080;
 
@@ -628,6 +637,8 @@ var gameState = {
     screenFlashAlpha: 0,
     paused: false,
 };
+var _sessionHighScore = 0;
+var _celebration = null; // { timer, duration, flybys[], nextFirework, nextFlyby }
 
 // === SECTION: Multiplayer Networking ===
 // --- WebSocket wrapper (replaces Socket.io) ---
@@ -691,9 +702,10 @@ document.addEventListener('keydown', function(ev) {
             var dp = gameState.players[di];
             if (dp.isLocal || (role === 'host' && di === 0)) {
                 dp.level = targetLevel;
-                dp.baseShields = targetLevel;
-                dp.shields = targetLevel;
-                dp.fireRate = 1000 / targetLevel;
+                dp.baseShields = Math.min(targetLevel, 5);
+                dp.shields = dp.baseShields;
+                var debugFireRates = [700, 600, 500, 450, 400, 360, 320, 280, 260, 240];
+                dp.fireRate = debugFireRates[targetLevel - 1] || 240;
                 dp.shotIndex = 0;
                 _godMode = false;
                 break;
@@ -1051,7 +1063,7 @@ function finalExplodeEnemy(e) {
     var aoeRadius = e.radius * 3;
     for (var pi = 0; pi < gameState.players.length; pi++) {
         var p = gameState.players[pi];
-        if (p && p.alive && !p.invulnerable) {
+        if (p && p.alive && !p.invulnerable && !p.voidDrifting) {
             if (gameDist(p.x, p.y, e.x, e.y) < aoeRadius + p.radius) {
                 hitPlayer(p, e.x, e.y);
             }
@@ -1079,73 +1091,94 @@ function finalExplodeEnemy(e) {
             carrierTakeDamage(car, 2);
         }
     }
+
+    // Grant XP to nearest alive player
+    var xpTarget = findNearestPlayer(e.x, e.y);
+    if (xpTarget) {
+        var baseXP = e.elite ? 25 : (e.type === 'corvette' ? 20 : 10);
+        addComboKill(xpTarget);
+        giveXP(xpTarget, baseXP);
+    }
 }
 
 function explodeEnemy(x, y, color) {
-    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, 0.12);
-    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 10);
-    // Primary burst — hot core
-    var count = budgetCount(40, 100);
+    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, 0.25);
+    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 18);
+    // Primary burst — massive shrapnel
+    var count = budgetCount(70, 140);
     for (var i = 0; i < count; i++) {
         var a = rand(0, Math.PI * 2);
-        var spd = rand(2, 10);
-        var isWhite = Math.random() > 0.5;
+        var spd = rand(2, 12);
+        var isWhite = Math.random() > 0.45;
         spawnParticle({
             x: x + rand(-8, 8),
             y: y + rand(-8, 8),
             vx: Math.cos(a) * spd,
             vy: Math.sin(a) * spd,
-            life: randInt(45, 110),
-            radius: rand(1.5, 5.5),
+            life: randInt(50, 130),
+            radius: rand(1.5, 6),
             color: isWhite ? '#FFFFFF' : color,
-            type: Math.random() > 0.6 ? 'spark' : 'circle',
+            type: Math.random() > 0.45 ? 'spark' : 'circle',
             angle: a,
             glow: true,
             shrink: true,
             friction: 0.95,
         });
     }
-    // Secondary slower embers — linger and drift
-    var emberCount = budgetCount(15, 35);
+    // Hot white core flash
+    var coreCount = budgetCount(15, 30);
+    for (var ci = 0; ci < coreCount; ci++) {
+        var ca = rand(0, Math.PI * 2);
+        spawnParticle({
+            x: x, y: y,
+            vx: Math.cos(ca) * rand(4, 10), vy: Math.sin(ca) * rand(4, 10),
+            life: randInt(6, 16), radius: rand(2, 4),
+            color: '#FFFFFF',
+            type: 'circle', angle: ca, glow: true, shrink: true, friction: 0.91,
+        });
+    }
+    // Lingering embers
+    var emberCount = budgetCount(25, 50);
     for (var ei = 0; ei < emberCount; ei++) {
         var ea = rand(0, Math.PI * 2);
-        var es = rand(0.3, 2);
+        var es = rand(0.2, 2);
         spawnParticle({
-            x: x + rand(-5, 5), y: y + rand(-5, 5),
+            x: x + rand(-8, 8), y: y + rand(-8, 8),
             vx: Math.cos(ea) * es, vy: Math.sin(ea) * es,
-            life: randInt(70, 150), radius: rand(1, 3.5),
+            life: randInt(80, 180), radius: rand(1, 4),
             color: randChoice([color, '#FF8800', '#FFCC00', '#FFFFFF']),
-            type: 'circle', angle: ea, glow: true, shrink: true, friction: 0.995,
+            type: 'circle', angle: ea, glow: true, shrink: true, friction: 0.997,
         });
     }
     // Debris chunks
-    for (var d = 0; d < budgetCount(3, 6); d++) {
+    for (var d = 0; d < budgetCount(5, 10); d++) {
         var da = rand(0, Math.PI * 2);
-        var ds = rand(1, 4);
+        var ds = rand(1.5, 5);
         var verts = [];
-        var nv = randInt(3, 5);
+        var nv = randInt(3, 6);
         for (var vi = 0; vi < nv; vi++) {
-            verts.push({ x: rand(-5, 5), y: rand(-5, 5) });
+            verts.push({ x: rand(-6, 6), y: rand(-6, 6) });
         }
         spawnParticle({
             x, y,
             vx: Math.cos(da) * ds,
             vy: Math.sin(da) * ds,
-            life: randInt(40, 70),
-            radius: rand(3, 7),
+            life: randInt(60, 110),
+            radius: rand(3, 9),
             color: color,
             type: 'debris',
             angle: rand(0, Math.PI * 2),
-            angleVel: rand(-0.12, 0.12),
+            angleVel: rand(-0.15, 0.15),
             glow: false,
             shrink: false,
             friction: 0.98,
             vertices: verts,
         });
     }
-    spawnRingWave(x, y, rand(70, 120), rand(2, 4), color);
-    spawnRingWave(x, y, rand(50, 90), rand(3, 5), '#FFFFFF');
-    spawnRingWave(x, y, rand(35, 60), rand(4, 6), color);
+    spawnRingWave(x, y, rand(100, 180), rand(2, 4), color);
+    spawnRingWave(x, y, rand(70, 130), rand(3, 5), '#FFFFFF');
+    spawnRingWave(x, y, rand(50, 90), rand(4, 6), color);
+    spawnRingWave(x, y, rand(30, 60), rand(5, 7), '#FFFFFF');
 }
 
 function tryDropShield(x, y) {
@@ -1205,58 +1238,70 @@ function explodeAsteroid(x, y, size) {
 }
 
 function explodePlayer(x, y) {
-    sfxExplosion(x, y, 0.8);
-    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, 0.3);
-    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 20);
-    // Primary burst
-    var count = budgetCount(40, 90);
-    var colors = ['#FFFFFF', '#00FFFF', '#0088FF', '#00CCFF', '#88FFFF'];
+    sfxExplosion(x, y, 1.0);
+    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, 0.6);
+    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 40);
+    // Primary burst — massive fast shrapnel
+    var count = budgetCount(80, 160);
+    var colors = ['#FFFFFF', '#00FFFF', '#0088FF', '#00CCFF', '#88FFFF', '#AAFFFF'];
     for (var i = 0; i < count; i++) {
         var a = rand(0, Math.PI * 2);
-        var spd = rand(1.5, 8);
+        var spd = rand(2, 14);
         spawnParticle({
-            x: x + rand(-5, 5),
-            y: y + rand(-5, 5),
+            x: x + rand(-8, 8),
+            y: y + rand(-8, 8),
             vx: Math.cos(a) * spd,
             vy: Math.sin(a) * spd,
-            life: randInt(45, 100),
-            radius: rand(1.5, 5),
+            life: randInt(50, 140),
+            radius: rand(1.5, 6),
             color: randChoice(colors),
-            type: Math.random() > 0.5 ? 'spark' : 'circle',
+            type: Math.random() > 0.4 ? 'spark' : 'circle',
             angle: a,
             glow: true,
             shrink: true,
-            friction: 0.95,
+            friction: 0.96,
         });
     }
-    // Slow embers
-    var emberCount = budgetCount(15, 30);
+    // Hot white core flash particles — very fast, short lived
+    var coreCount = budgetCount(20, 40);
+    for (var ci = 0; ci < coreCount; ci++) {
+        var ca = rand(0, Math.PI * 2);
+        spawnParticle({
+            x: x, y: y,
+            vx: Math.cos(ca) * rand(5, 12), vy: Math.sin(ca) * rand(5, 12),
+            life: randInt(8, 20), radius: rand(2, 5),
+            color: '#FFFFFF',
+            type: 'circle', angle: ca, glow: true, shrink: true, friction: 0.92,
+        });
+    }
+    // Slow embers — linger for a long time
+    var emberCount = budgetCount(30, 60);
     for (var ei = 0; ei < emberCount; ei++) {
         var ea = rand(0, Math.PI * 2);
         spawnParticle({
-            x: x + rand(-3, 3), y: y + rand(-3, 3),
-            vx: Math.cos(ea) * rand(0.2, 1.2), vy: Math.sin(ea) * rand(0.2, 1.2),
-            life: randInt(60, 130), radius: rand(1, 3),
-            color: randChoice(['#00FFFF', '#0088FF', '#FFFFFF']),
+            x: x + rand(-10, 10), y: y + rand(-10, 10),
+            vx: Math.cos(ea) * rand(0.2, 2), vy: Math.sin(ea) * rand(0.2, 2),
+            life: randInt(100, 220), radius: rand(1, 4),
+            color: randChoice(['#00FFFF', '#0088FF', '#FFFFFF', '#00CCFF']),
             type: 'circle', angle: ea, glow: true, shrink: true, friction: 0.998,
         });
     }
-    // Debris
-    for (var d = 0; d < budgetCount(4, 8); d++) {
+    // Large debris chunks
+    for (var d = 0; d < budgetCount(6, 12); d++) {
         var da = rand(0, Math.PI * 2);
-        var ds = rand(1, 4);
+        var ds = rand(1.5, 5);
         var verts = [];
-        var nv = randInt(3, 5);
+        var nv = randInt(3, 6);
         for (var vi = 0; vi < nv; vi++) {
-            verts.push({ x: rand(-6, 6), y: rand(-6, 6) });
+            verts.push({ x: rand(-8, 8), y: rand(-8, 8) });
         }
         spawnParticle({
             x, y,
             vx: Math.cos(da) * ds,
             vy: Math.sin(da) * ds,
-            life: randInt(50, 90),
-            radius: rand(3, 8),
-            color: randChoice(['#00FFFF', '#FFFFFF', '#0088FF']),
+            life: randInt(70, 130),
+            radius: rand(4, 10),
+            color: randChoice(['#00FFFF', '#FFFFFF', '#0088FF', '#004488']),
             type: 'debris',
             angle: rand(0, Math.PI * 2),
             angleVel: rand(-0.15, 0.15),
@@ -1266,10 +1311,14 @@ function explodePlayer(x, y) {
             vertices: verts,
         });
     }
-    spawnRingWave(x, y, 150, 3, '#00FFFF');
-    spawnRingWave(x, y, 120, 4, '#FFFFFF');
-    spawnRingWave(x, y, 80, 5, '#0088FF');
-    spawnRingWave(x, y, 50, 6, '#00FFFF');
+    // Ring waves — big expanding shockwaves
+    spawnRingWave(x, y, 250, 3, '#00FFFF');
+    spawnRingWave(x, y, 200, 4, '#FFFFFF');
+    spawnRingWave(x, y, 150, 5, '#0088FF');
+    spawnRingWave(x, y, 100, 6, '#00FFFF');
+    spawnRingWave(x, y, 60, 7, '#FFFFFF');
+    // AoE explosion zone
+    addExplosionZone(x, y, 200);
 }
 
 function warpEffect(x, y, phase) {
@@ -1319,6 +1368,78 @@ function addExplosionZone(x, y, maxRadius) {
     });
 }
 
+function giveXP(player, amount) {
+    if (!player || !player.alive) return;
+    var mult = 1;
+    // Combo multiplier
+    if (player.combo >= 30) mult = 6;
+    else if (player.combo >= 20) mult = 5;
+    else if (player.combo >= 15) mult = 4;
+    else if (player.combo >= 10) mult = 3;
+    else if (player.combo >= 6) mult = 2;
+    else if (player.combo >= 3) mult = 1.5;
+    // Drift bonus
+    if (player.drifting) mult *= 1.5;
+    var xpGain = Math.round(amount * mult);
+    player.xp += xpGain;
+    // Score popup
+    _scorePopups.push({
+        x: player.x + rand(-15, 15),
+        y: player.y - 20,
+        text: '+' + xpGain,
+        life: 60,
+        color: mult >= 4 ? '#FFCC00' : mult >= 2 ? '#FF8800' : '#FFFFFF',
+    });
+    // Level up check
+    if (player.level < 10 && player.xp >= player.xpToNext) {
+        player.xp -= player.xpToNext;
+        player.level++;
+        if (player.level <= 10) {
+            player.xpToNext = player.level < 10 ? XP_THRESHOLDS[player.level - 1] : 9999;
+        }
+        onLevelUp(player);
+    }
+    return xpGain;
+}
+
+function addComboKill(player) {
+    if (!player || !player.alive) return;
+    player.combo++;
+    player.comboTimer = player.drifting ? 6000 : 4000;
+    if (player.combo > player.bestCombo) player.bestCombo = player.combo;
+    player.killCount++;
+}
+
+function onLevelUp(p) {
+    // Stats that change per level
+    p.baseShields = Math.min(p.level, 5); // cap at 5
+    p.shields = p.baseShields;
+    p.maxShields = 5;
+    // Fire rate improves per level
+    var fireRates = [700, 600, 500, 450, 400, 360, 320, 280, 260, 240];
+    p.fireRate = fireRates[p.level - 1] || 240;
+    // Level-up visual burst
+    spawnRingWave(p.x, p.y, 120, 3, p.color);
+    spawnRingWave(p.x, p.y, 80, 4, '#FFFFFF');
+    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, 0.15);
+    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 10);
+    sparkShield(p.x, p.y);
+    sparkShield(p.x, p.y);
+    _levelUpText = LEVEL_NAMES[p.level - 1] || ('LEVEL ' + p.level);
+    _levelUpTimer = 2000;
+    _levelUpColor = p.color;
+    // L9: Create wingmen
+    if (p.level === 9 && p.wingmen.length === 0) {
+        for (var wi = 0; wi < 2; wi++) {
+            p.wingmen.push({
+                angle: wi * Math.PI, // opposite sides
+                fireTimer: 0,
+                fireRate: 500,
+            });
+        }
+    }
+}
+
 function createPlayer(colorIndex) {
     if (colorIndex === undefined) colorIndex = 0;
     return {
@@ -1361,6 +1482,19 @@ function createPlayer(colorIndex) {
         level: 1,
         baseShields: 1,
         shotIndex: 0,
+        xp: 0,
+        xpToNext: 30,
+        combo: 0,
+        comboTimer: 0,
+        comboMax: 0,
+        bestCombo: 0,
+        killCount: 0,
+        overdriveTimer: 0,
+        overdriveActive: false,
+        overdriveDuration: 0,
+        wingmen: [],
+        voidDriftCooldown: 0,
+        voidDrifting: false,
     };
 }
 
@@ -1418,6 +1552,32 @@ function createEnemy() {
         shieldAngle: rand(0, Math.PI * 2),
         rotation: 0,
     };
+}
+
+function createCorvette() {
+    var e = createEnemy();
+    e.type = 'corvette';
+    e.size = rand(55, 65);
+    e.radius = e.size * 0.45;
+    e.hp = 4;
+    e.maxHp = 4;
+    e.shields = 4;
+    e.maxShields = 6;
+    // Half speed
+    e.vx *= 0.5;
+    e.vy *= 0.5;
+    // Fires both torpedoes and a laser
+    e.fireInterval = rand(1800, 3200);
+    e.corvetteFireMode = 'torpedo'; // alternates between torpedo and laser
+    // Warp-in: spawn at a random safe location, start dead and respawn like a player
+    var spawn = findSafeSpawn();
+    e.x = spawn.x;
+    e.y = spawn.y;
+    e.warpingIn = true;
+    e.warpTimer = 0;
+    e.warpDuration = 1500;
+    e.alive = false; // not targetable until warp completes
+    return e;
 }
 
 function createAsteroid(size, x, y, vx, vy) {
@@ -1500,6 +1660,7 @@ function createBullet(x, y, angle, ownerId, color) {
         life: 90,
         trail: [],
         alive: true,
+        piercing: 0,
     };
 }
 
@@ -1585,7 +1746,7 @@ function updatePlayers(dt) {
     if (ms.down && p.alive && !isIdle && playerMouseInWindow) {
         if (!p.drifting) {
             // Entering drift: capture current velocity
-            var shipSpeed = p.level <= 1 ? 0.01 : p.level === 2 ? 0.008 : 0.007;
+            var shipSpeed = [0.012, 0.011, 0.011, 0.010, 0.010, 0.009, 0.009, 0.008, 0.008, 0.008][p.level - 1] || 0.008;
             var capVx = (ms.x - p.x) * shipSpeed;
             var capVy = (ms.y - p.y) * shipSpeed;
             var capSpd = Math.sqrt(capVx * capVx + capVy * capVy);
@@ -1624,7 +1785,12 @@ function updatePlayers(dt) {
         p.driftVx = 0;
         p.driftVy = 0;
         p.driftSteer = 0;
+        if (p.level >= 10) p.voidDriftCooldown = 3000;
     }
+
+    // L10: Void drift state
+    var isVoidDrifting = p.drifting && p.level >= 10 && p.voidDriftCooldown <= 0;
+    p.voidDrifting = isVoidDrifting;
 
     if (p.drifting) {
         // Slight curve toward where the mouse is (rear-wheel drift feel)
@@ -1660,7 +1826,7 @@ function updatePlayers(dt) {
     } else {
         var prevX = p.x;
         var prevY = p.y;
-        var shipSpeed = p.level <= 1 ? 0.01 : p.level === 2 ? 0.008 : 0.007;
+        var shipSpeed = [0.012, 0.011, 0.011, 0.010, 0.010, 0.009, 0.009, 0.008, 0.008, 0.008][p.level - 1] || 0.008;
         var lerpDx = (ms.x - p.x) * shipSpeed;
         var lerpDy = (ms.y - p.y) * shipSpeed;
         var lerpSpd = Math.sqrt(lerpDx * lerpDx + lerpDy * lerpDy);
@@ -1719,23 +1885,15 @@ function updatePlayers(dt) {
 
     // Engine trail / drift trail
     if (p.drifting) {
-        for (var si = 0; si < p.level; si++) {
-            if (p.level > 1 && Math.random() > 0.5) continue;
-            var etOffset = p.level === 1 ? 0 : (si - (p.level - 1) / 2) * 8;
-            var perpA = p.angle + Math.PI / 2;
-            var trailX = p.x - Math.cos(p.angle) * 12 + Math.cos(perpA) * etOffset;
-            var trailY = p.y - Math.sin(p.angle) * 12 + Math.sin(perpA) * etOffset;
-            driftTrail(trailX, trailY, p.angle, p.driftVx, p.driftVy, p.color);
-        }
+        var perpA = p.angle + Math.PI / 2;
+        var trailX = p.x - Math.cos(p.angle) * 12;
+        var trailY = p.y - Math.sin(p.angle) * 12;
+        driftTrail(trailX, trailY, p.angle, p.driftVx, p.driftVy, p.color);
     } else if (!isIdle || Math.random() > 0.7) {
-        for (var si = 0; si < p.level; si++) {
-            if (p.level > 1 && Math.random() > 0.5) continue;
-            var etOffset = p.level === 1 ? 0 : (si - (p.level - 1) / 2) * 8;
-            var perpA = p.angle + Math.PI / 2;
-            var trailX = p.x - Math.cos(p.angle) * 12 + Math.cos(perpA) * etOffset;
-            var trailY = p.y - Math.sin(p.angle) * 12 + Math.sin(perpA) * etOffset;
-            engineTrail(trailX, trailY, p.angle);
-        }
+        var perpA = p.angle + Math.PI / 2;
+        var trailX = p.x - Math.cos(p.angle) * 12;
+        var trailY = p.y - Math.sin(p.angle) * 12;
+        engineTrail(trailX, trailY, p.angle);
     }
 
     if (p.shields < p.baseShields) {
@@ -1746,16 +1904,87 @@ function updatePlayers(dt) {
         }
     }
 
+    // Combo timer decay
+    if (p.comboTimer > 0) {
+        p.comboTimer -= dt;
+        if (p.comboTimer <= 0) {
+            p.combo = 0;
+            p.comboTimer = 0;
+        }
+    }
+
+    // L8+: Overdrive — 10s no damage = 5s doubled fire rate
+    if (p.level >= 8 && p.alive) {
+        if (p.overdriveActive) {
+            p.overdriveDuration -= dt;
+            if (p.overdriveDuration <= 0) {
+                p.overdriveActive = false;
+                p.overdriveDuration = 0;
+            }
+        } else {
+            p.overdriveTimer += dt;
+            if (p.overdriveTimer >= 10000) {
+                p.overdriveActive = true;
+                p.overdriveDuration = 5000;
+                p.overdriveTimer = 0;
+                // Visual burst
+                spawnRingWave(p.x, p.y, 80, 3, '#FFFFFF');
+                gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 5);
+            }
+        }
+    }
+
+    // Void drift cooldown decay
+    if (p.voidDriftCooldown > 0) p.voidDriftCooldown -= dt;
+
+    // L9+: Wingmen update
+    if (p.level >= 9 && p.wingmen.length > 0 && p.alive) {
+        for (var wi = 0; wi < p.wingmen.length; wi++) {
+            var wm = p.wingmen[wi];
+            wm.angle += 2 * (dt / 1000); // orbit speed
+            var wmx = p.x + Math.cos(wm.angle) * 50;
+            var wmy = p.y + Math.sin(wm.angle) * 50;
+            // Engine trail for wingmen
+            if (Math.random() > 0.5) {
+                spawnParticle({
+                    x: wmx + rand(-2, 2), y: wmy + rand(-2, 2),
+                    vx: rand(-0.5, 0.5), vy: rand(-0.5, 0.5),
+                    life: randInt(8, 18), radius: rand(1, 2),
+                    color: p.color, glow: true, shrink: true, friction: 0.95,
+                });
+            }
+            // Wingman firing
+            wm.fireTimer += dt;
+            if (wm.fireTimer >= wm.fireRate) {
+                wm.fireTimer -= wm.fireRate;
+                // Find nearest enemy to wingman
+                var wmBest = null;
+                var wmBestDist = 300;
+                for (var wei = 0; wei < gameState.enemies.length; wei++) {
+                    var we = gameState.enemies[wei];
+                    if (!we.alive || we.dying || we.warpingIn) continue;
+                    var wd = gameDist(wmx, wmy, we.x, we.y);
+                    if (wd < wmBestDist) { wmBestDist = wd; wmBest = we; }
+                }
+                if (wmBest) {
+                    var wmAim = Math.atan2(wmBest.y - wmy, wmBest.x - wmx);
+                    gameState.bullets.push(createBullet(wmx, wmy, wmAim, p.id, p.color));
+                }
+            }
+        }
+    }
+
     p.shieldAngle += 2 * (dt / 1000);
 
     p.fireTimer += dt;
+    var effectiveFireRate = (p.overdriveActive) ? p.fireRate * 0.5 : p.fireRate;
     var hasTarget = findTarget(p).length > 0;
     if (!p.hadTarget && hasTarget) {
-        p.fireTimer = Math.max(p.fireTimer, p.fireRate - 200);
+        p.fireTimer = Math.max(p.fireTimer, effectiveFireRate - 200);
     }
     p.hadTarget = hasTarget;
-    if (p.fireTimer >= p.fireRate) {
-        p.fireTimer -= p.fireRate;
+    if (p.fireTimer >= effectiveFireRate) {
+        p.fireTimer -= effectiveFireRate;
         autoFire(p);
     }
     } // end players loop
@@ -1825,22 +2054,63 @@ function autoFire(p) {
     if (!target) return;
 
     var perpAngle = aimAngle + Math.PI / 2;
-    var shipCount = p.level;
-    var spacing = 8;
 
-    var offset;
-    if (shipCount === 1) {
-        offset = 0;
+    if (p.level >= 2) {
+        // Twin cannons — 2 bullets, alternating left/right
+        var twinSpacing = 6;
+        var side = (p.shotIndex % 2 === 0) ? -1 : 1;
+        var bx = p.x + Math.cos(aimAngle) * 14 + Math.cos(perpAngle) * twinSpacing * side;
+        var by = p.y + Math.sin(aimAngle) * 14 + Math.sin(perpAngle) * twinSpacing * side;
+        var bullet = createBullet(bx, by, aimAngle, p.id, p.color);
+        // L5+: piercing
+        if (p.level >= 5) bullet.piercing = 1;
+        // L6+: homing
+        if (p.level >= 6) bullet.homing = true;
+        // L3+: faster bullets
+        if (p.level >= 3) { bullet.vx *= 1.15; bullet.vy *= 1.15; }
+        // L10: void drift double damage
+        if (p.voidDrifting) bullet.voidDamage = true;
+        gameState.bullets.push(bullet);
+        sfxAt('blaster', bx, by, { volume: 0.4, rate: rand(0.9, 1.1) });
+        p.shotIndex++;
     } else {
-        offset = (p.shotIndex - (shipCount - 1) / 2) * spacing;
+        // Single cannon
+        var bx = p.x + Math.cos(aimAngle) * 14;
+        var by = p.y + Math.sin(aimAngle) * 14;
+        gameState.bullets.push(createBullet(bx, by, aimAngle, p.id, p.color));
+        sfxAt('blaster', bx, by, { volume: 0.4, rate: rand(0.9, 1.1) });
     }
 
-    var bx = p.x + Math.cos(aimAngle) * 14 + Math.cos(perpAngle) * offset;
-    var by = p.y + Math.sin(aimAngle) * 14 + Math.sin(perpAngle) * offset;
-    gameState.bullets.push(createBullet(bx, by, aimAngle, p.id, p.color));
-    sfxAt('blaster', bx, by, { volume: 0.4, rate: rand(0.9, 1.1) });
-
-    p.shotIndex = (p.shotIndex + 1) % shipCount;
+    // L4+: Rear gun — fires backward at half rate
+    if (p.level >= 4 && p.shotIndex % 4 === 0) {
+        var rearAngle = aimAngle + Math.PI;
+        var rearTarget = null;
+        var rearBestDist = 300;
+        for (var ri = 0; ri < gameState.enemies.length; ri++) {
+            var re = gameState.enemies[ri];
+            if (!re.alive || re.dying) continue;
+            var rd = gameDist(p.x, p.y, re.x, re.y);
+            if (rd < rearBestDist) {
+                var rAngle = Math.atan2(re.y - p.y, re.x - p.x);
+                var rDiff = Math.abs(angleWrap(rAngle - rearAngle));
+                if (rDiff < Math.PI / 3) {
+                    rearBestDist = rd;
+                    rearTarget = re;
+                }
+            }
+        }
+        if (rearTarget) {
+            var rAim = Math.atan2(rearTarget.y - p.y, rearTarget.x - p.x);
+            var rbx = p.x + Math.cos(rAim) * -10;
+            var rby = p.y + Math.sin(rAim) * -10;
+            var rBullet = createBullet(rbx, rby, rAim, p.id, p.color);
+            if (p.level >= 5) rBullet.piercing = 1;
+            if (p.level >= 6) rBullet.homing = true;
+            if (p.level >= 3) { rBullet.vx *= 1.15; rBullet.vy *= 1.15; }
+            if (p.voidDrifting) rBullet.voidDamage = true;
+            gameState.bullets.push(rBullet);
+        }
+    }
 }
 
 function updateBullets(dt) {
@@ -1852,6 +2122,30 @@ function updateBullets(dt) {
         b.x += b.vx;
         b.y += b.vy;
         b.life--;
+
+        // Homing — gently curve toward nearest enemy
+        if (b.homing) {
+            var homeBest = null;
+            var homeDist = 60; // detection radius
+            for (var hi = 0; hi < gameState.enemies.length; hi++) {
+                var he = gameState.enemies[hi];
+                if (!he.alive || he.dying || he.warpingIn) continue;
+                var hd = gameDist(b.x, b.y, he.x, he.y);
+                if (hd < homeDist) { homeDist = hd; homeBest = he; }
+            }
+            if (homeBest) {
+                var targetAngle = Math.atan2(homeBest.y - b.y, homeBest.x - b.x);
+                var bulletAngle = Math.atan2(b.vy, b.vx);
+                var diff = angleWrap(targetAngle - bulletAngle);
+                var maxTurn = 0.08; // ~4.5 degrees per frame
+                var turn = clamp(diff, -maxTurn, maxTurn);
+                var speed = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
+                var newAngle = bulletAngle + turn;
+                b.vx = Math.cos(newAngle) * speed;
+                b.vy = Math.sin(newAngle) * speed;
+                b.angle = newAngle;
+            }
+        }
 
         if (b.life <= 0 || b.x < -20 || b.x > canvasW + 20 || b.y < -20 || b.y > canvasH + 20) {
             b.alive = false;
@@ -2125,6 +2419,8 @@ function updateCarriers(dt) {
                 });
             }
             gameState.score += 500;
+            var carrierXPTarget = findNearestPlayer(c.x, c.y);
+            if (carrierXPTarget) { addComboKill(carrierXPTarget); giveXP(carrierXPTarget, 100); }
         }
 
         // Phase 3 (50-100%): chunks drift and explode individually
@@ -2618,13 +2914,29 @@ function drawCarrier(c) {
 }
 
 function getMaxEnemies() {
-    var maxLevel = 0;
-    for (var i = 0; i < gameState.players.length; i++) {
-        if (gameState.players[i].alive && gameState.players[i].level > maxLevel) {
-            maxLevel = gameState.players[i].level;
-        }
-    }
-    return maxLevel >= 4 ? 24 : 12;
+    var minutes = gameState.time / 60000;
+    if (minutes < 1) return 8;
+    if (minutes < 2) return 10;
+    if (minutes < 3) return 12;
+    if (minutes < 5) return 14;
+    if (minutes < 7) return 16;
+    if (minutes < 9) return 18;
+    if (minutes < 12) return 20;
+    if (minutes < 15) return 22;
+    return 24;
+}
+
+function getEnemyShieldChance() {
+    var minutes = gameState.time / 60000;
+    if (minutes < 1) return 0;
+    if (minutes < 2) return 0.1;
+    if (minutes < 3) return 0.2;
+    if (minutes < 5) return 0.3;
+    if (minutes < 7) return 0.4;
+    if (minutes < 9) return 0.5;
+    if (minutes < 12) return 0.6;
+    if (minutes < 15) return 0.7;
+    return 0.8;
 }
 
 function updateEnemies(dt) {
@@ -2634,17 +2946,52 @@ function updateEnemies(dt) {
     var spawnInterval = rand(2500, 5000);
     if (gameState.spawnTimers.enemy >= spawnInterval && gameState.enemies.length < getMaxEnemies()) {
         gameState.spawnTimers.enemy = 0;
-        var newEnemy = createEnemy();
-        // Chance of starting with a shield based on max player level
         var plNearest = findNearestPlayer(canvasW / 2, canvasH / 2);
-        var pl = plNearest ? plNearest.level : 1;
-        var shieldChance = pl === 2 ? 0.25 : pl === 3 ? 0.5 : pl >= 4 ? 0.75 : 0;
-        if (Math.random() < shieldChance) newEnemy.shields = 1;
+        // Use highest level of any player (alive or dead) for spawn decisions
+        var pl = 1;
+        for (var pli = 0; pli < gameState.players.length; pli++) {
+            if (gameState.players[pli].level > pl) pl = gameState.players[pli].level;
+        }
+        var minutes = gameState.time / 60000;
+        var corvetteChance = minutes < 2 ? 0 : minutes < 5 ? 0.15 : minutes < 9 ? 0.25 : 0.35;
+        var newEnemy;
+        if (Math.random() < corvetteChance) {
+            newEnemy = createCorvette();
+        } else {
+            newEnemy = createEnemy();
+        }
+        var shieldChance = getEnemyShieldChance();
+        if (newEnemy.type !== 'corvette' && Math.random() < shieldChance) newEnemy.shields = 1;
         gameState.enemies.push(newEnemy);
     }
 
     for (var i = gameState.enemies.length - 1; i >= 0; i--) {
         var e = gameState.enemies[i];
+
+        // Corvette warp-in sequence
+        if (e.warpingIn) {
+            e.warpTimer += dt;
+            var warpPhase = clamp(e.warpTimer / e.warpDuration, 0, 1);
+
+            if (e.warpTimer < 500) {
+                warpEffect(e.x, e.y, 0.2);
+            } else if (e.warpTimer < 1000) {
+                warpEffect(e.x, e.y, 0.5);
+            } else if (e.warpTimer < 1500) {
+                warpEffect(e.x, e.y, 0.8);
+            }
+
+            if (e.warpTimer >= e.warpDuration) {
+                e.warpingIn = false;
+                e.alive = true;
+                e.fadeIn = 1;
+                e.spawnTime = gameState.time;
+                warpEffect(e.x, e.y, 1.0);
+                sfxAt('warp-in', e.x, e.y);
+                spawnRingWave(e.x, e.y, rand(60, 100), rand(3, 5), e.color);
+            }
+            continue;
+        }
 
         // Dying state — on fire, drifting, then explode
         if (e.dying) {
@@ -2652,6 +2999,98 @@ function updateEnemies(dt) {
             e.x += e.vx * 0.5;
             e.y += e.vy * 0.5;
             e.rotation += 0.03;
+
+            // Corvette chunk phase
+            if (e.type === 'corvette' && e.corvetteChunks) {
+                var cAnyAlive = false;
+                for (var cci = 0; cci < e.corvetteChunks.length; cci++) {
+                    var cc = e.corvetteChunks[cci];
+                    if (!cc.alive) continue;
+                    cAnyAlive = true;
+                    cc.x += cc.vx;
+                    cc.y += cc.vy;
+                    cc.rotation += cc.rotSpeed;
+                    // Fire trail
+                    if (Math.random() > 0.3) {
+                        spawnParticle({
+                            x: cc.x + rand(-4, 4), y: cc.y + rand(-4, 4),
+                            vx: -cc.vx * 0.3 + rand(-0.4, 0.4), vy: -cc.vy * 0.3 + rand(-0.4, 0.4),
+                            life: randInt(12, 30), radius: rand(1, 3),
+                            color: randChoice(['#FF2200', '#FF4400', '#FF8800', '#FFCC00']),
+                            type: Math.random() > 0.5 ? 'spark' : 'circle',
+                            angle: rand(0, Math.PI * 2), glow: true, shrink: true, friction: 0.96,
+                        });
+                    }
+                    // Mini explosion on chunk
+                    cc.boomTimer += dt;
+                    if (cc.boomTimer >= cc.nextBoom) {
+                        cc.boomTimer = 0;
+                        cc.nextBoom = rand(150, 400);
+                        var mcCount = budgetCount(6, 14);
+                        for (var mci = 0; mci < mcCount; mci++) {
+                            var mca = rand(0, Math.PI * 2);
+                            spawnParticle({
+                                x: cc.x, y: cc.y,
+                                vx: Math.cos(mca) * rand(1, 4), vy: Math.sin(mca) * rand(1, 4),
+                                life: randInt(15, 35), radius: rand(1, 3),
+                                color: randChoice(['#FF4400', '#FF8800', '#FFFFFF']),
+                                type: 'spark', angle: mca, glow: true, shrink: true, friction: 0.94,
+                            });
+                        }
+                        spawnRingWave(cc.x, cc.y, rand(20, 40), rand(2, 4), randChoice(['#FF4400', '#FFFFFF']));
+                        gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, rand(3, 7));
+                    }
+                    // Chunk final explosion
+                    cc.life -= dt;
+                    if (cc.life <= 0) {
+                        cc.alive = false;
+                        var fcCount = budgetCount(20, 40);
+                        for (var fci = 0; fci < fcCount; fci++) {
+                            var fca = rand(0, Math.PI * 2);
+                            spawnParticle({
+                                x: cc.x, y: cc.y,
+                                vx: Math.cos(fca) * rand(1.5, 7), vy: Math.sin(fca) * rand(1.5, 7),
+                                life: randInt(30, 70), radius: rand(1.5, 5),
+                                color: randChoice(['#FF0000', '#FF4400', '#FF8800', '#FFCC00', '#FFFFFF']),
+                                type: Math.random() > 0.4 ? 'spark' : 'circle',
+                                angle: fca, glow: true, shrink: true, friction: 0.95,
+                            });
+                        }
+                        spawnRingWave(cc.x, cc.y, rand(40, 70), rand(3, 5), e.color);
+                        spawnRingWave(cc.x, cc.y, rand(25, 45), rand(4, 6), '#FFFFFF');
+                        addExplosionZone(cc.x, cc.y, rand(50, 80));
+                        gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, rand(8, 14));
+                        gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, rand(0.1, 0.2));
+                        sfxExplosion(cc.x, cc.y, 0.5);
+                    }
+                }
+                if (!cAnyAlive) {
+                    // All chunks gone — final boom
+                    sfxExplosion(e.x, e.y, 0.7);
+                    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, 0.4);
+                    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 25);
+                    spawnRingWave(e.x, e.y, rand(100, 150), rand(3, 5), e.color);
+                    spawnRingWave(e.x, e.y, rand(70, 110), rand(4, 6), '#FFFFFF');
+                    addExplosionZone(e.x, e.y, 150);
+                    var finCount = budgetCount(30, 60);
+                    for (var fni = 0; fni < finCount; fni++) {
+                        var fna = rand(0, Math.PI * 2);
+                        spawnParticle({
+                            x: e.x + rand(-10, 10), y: e.y + rand(-10, 10),
+                            vx: Math.cos(fna) * rand(1, 8), vy: Math.sin(fna) * rand(1, 8),
+                            life: randInt(40, 100), radius: rand(1.5, 5),
+                            color: randChoice(['#FF4400', '#FF8800', '#FFCC00', '#FFFFFF']),
+                            type: Math.random() > 0.3 ? 'spark' : 'circle',
+                            angle: fna, glow: true, shrink: true, friction: 0.96,
+                        });
+                    }
+                    e.alive = false;
+                    tryDropShield(e.x, e.y);
+                    gameState.enemies.splice(i, 1);
+                }
+                continue;
+            }
+
             // Fire/smoke particles
             if (e.dyingTimer >= e.dyingNextFire) {
                 e.dyingNextFire = e.dyingTimer + rand(40, 100);
@@ -2671,11 +3110,57 @@ function updateEnemies(dt) {
             if (Math.random() < 0.02) {
                 gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 2);
             }
-            // Final explosion
+            // Final explosion — corvettes break into chunks instead
             if (e.dyingTimer >= e.dyingDuration) {
-                finalExplodeEnemy(e);
+                if (e.type === 'corvette' && !e.corvetteChunks) {
+                    // Spawn 2-4 chunks
+                    e.corvetteChunks = [];
+                    var numChunks = randInt(2, 4);
+                    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, 0.25);
+                    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 18);
+                    spawnRingWave(e.x, e.y, rand(60, 90), rand(2, 4), e.color);
+                    spawnRingWave(e.x, e.y, rand(40, 60), rand(3, 5), '#FFFFFF');
+                    addExplosionZone(e.x, e.y, 100);
+                    sfxExplosion(e.x, e.y, 0.6);
+                    // Breakup burst
+                    var bbCount = budgetCount(20, 40);
+                    for (var bbi = 0; bbi < bbCount; bbi++) {
+                        var bba = rand(0, Math.PI * 2);
+                        spawnParticle({
+                            x: e.x + rand(-8, 8), y: e.y + rand(-8, 8),
+                            vx: Math.cos(bba) * rand(2, 6), vy: Math.sin(bba) * rand(2, 6),
+                            life: randInt(25, 55), radius: rand(1.5, 4),
+                            color: randChoice(['#FF4400', '#FF8800', '#FFCC00', '#FFFFFF']),
+                            type: Math.random() > 0.4 ? 'spark' : 'circle',
+                            angle: bba, glow: true, shrink: true, friction: 0.95,
+                        });
+                    }
+                    for (var cci = 0; cci < numChunks; cci++) {
+                        var cca = (cci / numChunks) * Math.PI * 2 + rand(-0.4, 0.4);
+                        var ccverts = [];
+                        for (var ccvi = 0; ccvi < randInt(3, 5); ccvi++) {
+                            ccverts.push({ x: rand(-8, 8), y: rand(-6, 6) });
+                        }
+                        e.corvetteChunks.push({
+                            x: e.x + Math.cos(cca) * rand(5, 15),
+                            y: e.y + Math.sin(cca) * rand(5, 15),
+                            vx: Math.cos(cca) * rand(0.6, 2),
+                            vy: Math.sin(cca) * rand(0.6, 2),
+                            rotation: rand(0, Math.PI * 2),
+                            rotSpeed: rand(-0.1, 0.1),
+                            radius: rand(6, 12),
+                            vertices: ccverts,
+                            alive: true,
+                            life: rand(800, 1600),
+                            boomTimer: 0,
+                            nextBoom: rand(150, 400),
+                        });
+                    }
+                } else {
+                    finalExplodeEnemy(e);
+                }
             }
-            if (!e.alive) {
+            if (!e.alive && !e.warpingIn) {
                 gameState.enemies.splice(i, 1);
             }
             continue;
@@ -2721,6 +3206,7 @@ function updateEnemies(dt) {
         if (nearestP && !inBarrageZone) {
             var pa = Math.atan2(nearestP.y - e.y, nearestP.x - e.x);
             var pursuitStr = e.elite ? 1.2 : 0.3;
+            if (e.type === 'corvette') pursuitStr *= 0.5;
             if (e.behavior === 'aggressive') {
                 pursuitStr = e.elite ? 1.5 : 0.8;
                 e.vx += Math.cos(pa) * pursuitStr * (dt / 1000);
@@ -2791,6 +3277,13 @@ function updateEnemies(dt) {
         e.x += e.vx;
         e.y += e.vy + hover * (dt / 16);
 
+        // Cap corvette speed
+        if (e.type === 'corvette') {
+            var cSpd = Math.sqrt(e.vx * e.vx + e.vy * e.vy);
+            var cMaxSpd = 0.75;
+            if (cSpd > cMaxSpd) { e.vx = (e.vx / cSpd) * cMaxSpd; e.vy = (e.vy / cSpd) * cMaxSpd; }
+        }
+
         if (e.damageFlashTimer > 0) e.damageFlashTimer -= dt;
 
         // Enemy firing logic
@@ -2801,6 +3294,10 @@ function updateEnemies(dt) {
             var isLaser = false;
             for (var lci = 0; lci < laserColors.length; lci++) {
                 if (e.color === laserColors[lci]) { isLaser = true; break; }
+            }
+            // Corvettes alternate between torpedo and laser
+            if (e.type === 'corvette') {
+                isLaser = (e.corvetteFireMode === 'laser');
             }
 
             // Burst firing for bullet enemies
@@ -2841,6 +3338,9 @@ function updateEnemies(dt) {
                     e.fireTimer = 0;
                     e.fireInterval = rand(2000, 4000);
                     e.charging = 0;
+                    if (e.type === 'corvette') {
+                        e.corvetteFireMode = e.corvetteFireMode === 'torpedo' ? 'laser' : 'torpedo';
+                    }
                     if (!isLaser) {
                         // Start a 3-shot burst
                         e.burstRemaining = randInt(2, 5);
@@ -2875,7 +3375,7 @@ function updateEnemies(dt) {
                             // Check laser vs all players on creation
                             for (var lpi = 0; lpi < gameState.players.length; lpi++) {
                                 var pp = gameState.players[lpi];
-                                if (pp.alive && !pp.invulnerable) {
+                                if (pp.alive && !pp.invulnerable && !pp.voidDrifting) {
                                     var ptDist = pointToSegDist(pp.x, pp.y, newLaser.x1, newLaser.y1, newLaser.x2, newLaser.y2);
                                     if (ptDist < pp.radius + newLaser.width) {
                                         var sdx = newLaser.x2 - newLaser.x1;
@@ -2901,7 +3401,7 @@ function updateEnemies(dt) {
         if (e.x < -despawnMargin || e.x > canvasW + despawnMargin || e.y < -despawnMargin || e.y > canvasH + despawnMargin) {
             e.alive = false;
         }
-        if (!e.alive) {
+        if (!e.alive && !e.warpingIn) {
             gameState.enemies.splice(i, 1);
         }
     }
@@ -3057,9 +3557,18 @@ function checkCollisions() {
         for (var ei = enemies.length - 1; ei >= 0; ei--) {
             var e = enemies[ei];
             if (!e.alive || e.dying) continue;
+            if (b._hitIds && b._hitIds[e.id]) continue;
             if (gameDist(b.x, b.y, e.x, e.y) < b.radius + e.radius) {
-                b.alive = false;
-                bulletImpact(b.x, b.y);
+                if (b.piercing > 0) {
+                    b.piercing--;
+                    bulletImpact(b.x, b.y);
+                    // Mark this enemy as already hit by this bullet this frame
+                    if (!b._hitIds) b._hitIds = {};
+                    b._hitIds[e.id] = true;
+                } else {
+                    b.alive = false;
+                    bulletImpact(b.x, b.y);
+                }
                 e.damageFlashTimer = 150;
                 if (e.shields > 0) {
                     e.shields--;
@@ -3068,7 +3577,7 @@ function checkCollisions() {
                         e.behavior = 'aggressive';
                     }
                 } else {
-                    e.hp--;
+                    e.hp -= (b.voidDamage ? 2 : 1);
                     if (e.hp <= 0) {
                         killEnemy(e);
                     } else {
@@ -3126,7 +3635,7 @@ function checkCollisions() {
 
     for (var cpi = 0; cpi < gameState.players.length; cpi++) {
         var p = gameState.players[cpi];
-        if (p && p.alive && !p.invulnerable) {
+        if (p && p.alive && !p.invulnerable && !p.voidDrifting) {
             for (var ei = enemies.length - 1; ei >= 0; ei--) {
                 var e = enemies[ei];
                 if (!e.alive || e.dying) continue;
@@ -3140,7 +3649,7 @@ function checkCollisions() {
 
     for (var cpi2 = 0; cpi2 < gameState.players.length; cpi2++) {
         var p = gameState.players[cpi2];
-        if (p && p.alive && !p.invulnerable) {
+        if (p && p.alive && !p.invulnerable && !p.voidDrifting) {
             for (var ai = asteroids.length - 1; ai >= 0; ai--) {
                 var a = asteroids[ai];
                 if (!a.alive) continue;
@@ -3269,6 +3778,7 @@ function checkCollisions() {
     for (var cpi3 = 0; cpi3 < gameState.players.length; cpi3++) {
         var p = gameState.players[cpi3];
         if (p && p.alive && !p.invulnerable) {
+            if (p.voidDrifting) continue;
             for (var ebi = gameState.enemyBullets.length - 1; ebi >= 0; ebi--) {
                 var eb = gameState.enemyBullets[ebi];
                 if (!eb.alive) continue;
@@ -3306,7 +3816,7 @@ function checkCollisions() {
         if (car && car.alive) {
             for (var cpi4 = 0; cpi4 < gameState.players.length; cpi4++) {
                 var p = gameState.players[cpi4];
-                if (p && p.alive && !p.invulnerable) {
+                if (p && p.alive && !p.invulnerable && !p.voidDrifting) {
                     if (gameDist(p.x, p.y, car.x, car.y) < p.radius + car.radius) {
                         hitPlayer(p, car.x, car.y);
                     }
@@ -3333,7 +3843,7 @@ function checkCollisions() {
         if (!bullets[bi].alive) bullets.splice(bi, 1);
     }
     for (var ei = enemies.length - 1; ei >= 0; ei--) {
-        if (!enemies[ei].alive) enemies.splice(ei, 1);
+        if (!enemies[ei].alive && !enemies[ei].warpingIn) enemies.splice(ei, 1);
     }
     for (var ai = asteroids.length - 1; ai >= 0; ai--) {
         if (!asteroids[ai].alive) asteroids.splice(ai, 1);
@@ -3351,20 +3861,82 @@ function hitPlayer(p, hitX, hitY) {
     p.drifting = false;
     p.driftVx = 0;
     p.driftVy = 0;
+    p.overdriveTimer = 0;
 
     if (p.shields > 0) {
         p.shields--;
         sparkShield(hitX, hitY);
         p.invulnerable = true;
         p.invulnerableTimer = 300;
+        // L7+: Shield pulse — knockback wave on shield break
+        if (p.level >= 7) {
+            var pulseRadius = 60;
+            spawnRingWave(p.x, p.y, pulseRadius, 4, p.color);
+            // Knockback + 1 damage to nearby enemies
+            for (var spi = gameState.enemies.length - 1; spi >= 0; spi--) {
+                var spe = gameState.enemies[spi];
+                if (!spe.alive || spe.dying) continue;
+                var spDist = gameDist(p.x, p.y, spe.x, spe.y);
+                if (spDist < pulseRadius + spe.radius) {
+                    // Knockback
+                    var spAngle = Math.atan2(spe.y - p.y, spe.x - p.x);
+                    spe.vx += Math.cos(spAngle) * 3;
+                    spe.vy += Math.sin(spAngle) * 3;
+                    // 1 damage
+                    if (spe.shields > 0) {
+                        spe.shields--;
+                        sparkShield(spe.x, spe.y);
+                    } else {
+                        spe.hp--;
+                        if (spe.hp <= 0) killEnemy(spe);
+                    }
+                    spe.damageFlashTimer = 150;
+                }
+            }
+            gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 8);
+        }
     } else {
+        var isNewBest = _sessionHighScore > 0 && gameState.score >= _sessionHighScore;
+        if (gameState.score > _sessionHighScore) _sessionHighScore = gameState.score;
+        if (isNewBest) {
+            _celebration = {
+                timer: 0,
+                duration: 6000,
+                flybys: [],
+                nextFirework: 200,
+                nextFlyby: 0,
+            };
+        }
+        _deathStats = {
+            score: gameState.score,
+            highScore: _sessionHighScore,
+            isNewBest: isNewBest,
+            level: p.level,
+            levelName: LEVEL_NAMES[p.level - 1] || '',
+            combo: p.bestCombo,
+            kills: p.killCount,
+            time: Math.round(gameState.time / 1000),
+        };
+        _deathStatsTimer = 4000;
+        gameState.score = 0;
         p.alive = false;
         p.deathTime = gameState.time;
         p.respawning = false;
         p.level = 1;
         p.baseShields = 1;
-        p.fireRate = 1000;
+        p.fireRate = 700;
         p.shotIndex = 0;
+        p.xp = 0;
+        p.xpToNext = 30;
+        p.combo = 0;
+        p.comboTimer = 0;
+        p.killCount = 0;
+        p.overdriveTimer = 0;
+        p.overdriveActive = false;
+        p.overdriveDuration = 0;
+        p.wingmen = [];
+        p.voidDriftCooldown = 0;
+        p.voidDrifting = false;
         explodePlayer(p.x, p.y);
         addExplosionZone(p.x, p.y, 150);
         gameState.screenFlashAlpha = 0.25;
@@ -3415,12 +3987,17 @@ function drawPlayers() {
     gameCtx.rotate(p.angle);
     gameCtx.scale(p.scale, p.scale);
     gameCtx.globalAlpha = p.opacity;
+    if (p.voidDrifting) gameCtx.globalAlpha *= 0.4;
 
-    var shipCount = p.level;
+    if (p.overdriveActive) {
+        drawGlow(gameCtx, 0, 0, '#FFFFFF', p.radius + 20, 0.4 + Math.sin(gameState.time * 0.015) * 0.2);
+    }
+
+    var shipCount = 1;
     var spacing = 8;
 
     for (var si = 0; si < shipCount; si++) {
-        var offset = shipCount === 1 ? 0 : (si - (shipCount - 1) / 2) * spacing;
+        var offset = 0;
 
         gameCtx.save();
         gameCtx.translate(0, offset);
@@ -3460,7 +4037,96 @@ function drawPlayers() {
 
     gameCtx.restore();
 
+    // Draw wingmen
+    if (p.level >= 9 && p.wingmen && p.wingmen.length > 0 && p.alive) {
+        for (var wi = 0; wi < p.wingmen.length; wi++) {
+            var wm = p.wingmen[wi];
+            var wmx = p.x + Math.cos(wm.angle) * 50;
+            var wmy = p.y + Math.sin(wm.angle) * 50;
+            gameCtx.save();
+            gameCtx.translate(wmx, wmy);
+            gameCtx.rotate(wm.angle + Math.PI / 2);
+            drawGlow(gameCtx, 0, 0, p.color, 12, 0.3);
+            gameCtx.fillStyle = p.color;
+            gameCtx.globalAlpha = 0.8;
+            gameCtx.beginPath();
+            gameCtx.moveTo(6, 0);
+            gameCtx.lineTo(-4, -4);
+            gameCtx.lineTo(-2, 0);
+            gameCtx.lineTo(-4, 4);
+            gameCtx.closePath();
+            gameCtx.fill();
+            gameCtx.restore();
+        }
+    }
+
     drawShields(p);
+
+    // XP rings around ship — one ring per completed level, current level fills as arc
+    if (p.alive) {
+        var baseRingRadius = 18;
+        var ringSpacing = 3;
+        var xpFill = p.level < 10 ? clamp(p.xp / p.xpToNext, 0, 1) : 1;
+        var startAngle = -Math.PI / 2; // 12 o'clock
+
+        gameCtx.save();
+        gameCtx.lineCap = 'round';
+
+        // Completed level rings (dim)
+        for (var ri = 0; ri < p.level - 1 && ri < 9; ri++) {
+            var rr = baseRingRadius + ri * ringSpacing;
+            gameCtx.beginPath();
+            gameCtx.arc(p.x, p.y, rr, 0, Math.PI * 2);
+            gameCtx.strokeStyle = p.color;
+            gameCtx.lineWidth = 1.5;
+            gameCtx.globalAlpha = 0.12;
+            gameCtx.stroke();
+        }
+
+        // Current level ring (filling arc, bright)
+        if (p.level < 10) {
+            var currentRR = baseRingRadius + (p.level - 1) * ringSpacing;
+            // Background track
+            gameCtx.beginPath();
+            gameCtx.arc(p.x, p.y, currentRR, 0, Math.PI * 2);
+            gameCtx.strokeStyle = p.color;
+            gameCtx.lineWidth = 2;
+            gameCtx.globalAlpha = 0.08;
+            gameCtx.stroke();
+            // Fill arc
+            var fillEnd = startAngle + xpFill * Math.PI * 2;
+            gameCtx.beginPath();
+            gameCtx.arc(p.x, p.y, currentRR, startAngle, fillEnd);
+            gameCtx.strokeStyle = p.color;
+            gameCtx.lineWidth = 2;
+            gameCtx.globalAlpha = 0.4 + (xpFill > 0.8 ? Math.sin(gameState.time * 0.01) * 0.25 : 0);
+            gameCtx.stroke();
+            // Bright dot at the fill tip
+            if (xpFill > 0.02) {
+                var dotX = p.x + Math.cos(fillEnd) * currentRR;
+                var dotY = p.y + Math.sin(fillEnd) * currentRR;
+                gameCtx.globalAlpha = 0.6;
+                gameCtx.fillStyle = '#FFFFFF';
+                gameCtx.beginPath();
+                gameCtx.arc(dotX, dotY, 1.5, 0, Math.PI * 2);
+                gameCtx.fill();
+            }
+        } else {
+            // L10: all 9 rings glow brighter
+            for (var ri = 0; ri < 9; ri++) {
+                var rr = baseRingRadius + ri * ringSpacing;
+                gameCtx.beginPath();
+                gameCtx.arc(p.x, p.y, rr, 0, Math.PI * 2);
+                gameCtx.strokeStyle = p.color;
+                gameCtx.lineWidth = 1.5;
+                gameCtx.globalAlpha = 0.25 + Math.sin(gameState.time * 0.005 + ri * 0.3) * 0.1;
+                gameCtx.stroke();
+            }
+        }
+
+        gameCtx.restore();
+    }
+
     } // end players loop
 }
 
@@ -3527,22 +4193,6 @@ function updateShieldPickups(dt) {
                     sfxAt('shield-pickup', sp.x, sp.y, { volume: 0.5 });
                     // Pickup sparkle effect
                     sparkShield(sp.x, sp.y);
-                    // Check for upgrade
-                    if (p.shields >= p.maxShields && p.level < 4) {
-                        p.level++;
-                        p.baseShields = p.level;
-                        p.shields = p.baseShields;
-                        p.fireRate = 1000 / p.level;
-                        p.shotIndex = 0;
-                        sparkShield(p.x, p.y);
-                        sparkShield(p.x, p.y);
-                        gameState.ringWaves.push({
-                            x: p.x, y: p.y,
-                            radius: 0, maxRadius: 80,
-                            expandSpeed: 4, lineWidth: 3,
-                            color: p.color, alpha: 0.8
-                        });
-                    }
                     gameState.shieldPickups.splice(i, 1);
                     pickedByPlayer = true;
                     break;
@@ -3581,7 +4231,7 @@ function updateShieldPickups(dt) {
             var aoeRadius = 50;
             for (var mpi = 0; mpi < gameState.players.length; mpi++) {
                 var mp = gameState.players[mpi];
-                if (mp && mp.alive && !mp.invulnerable) {
+                if (mp && mp.alive && !mp.invulnerable && !mp.voidDrifting) {
                     if (gameDist(mp.x, mp.y, sp.x, sp.y) < aoeRadius + mp.radius) {
                         hitPlayer(mp, sp.x, sp.y);
                     }
@@ -3724,7 +4374,7 @@ function drawWarpAnimation(p) {
         gameCtx.rotate(p.angle);
         gameCtx.scale(lerp(2, 1, ph), lerp(2, 1, ph));
 
-        var warpShipCount = p.level;
+        var warpShipCount = 1;
         var warpSpacing = 8;
         for (var wsi = 0; wsi < warpShipCount; wsi++) {
             var warpOffset = warpShipCount === 1 ? 0 : (wsi - (warpShipCount - 1) / 2) * warpSpacing;
@@ -3795,6 +4445,54 @@ function drawEnemies() {
         var e = gameState.enemies[i];
         if (e.x < -50 || e.x > canvasW + 50 || e.y < -50 || e.y > canvasH + 50) continue;
         if (e.charging > 0) continue; // drawn in pass 2
+
+        // Warping-in corvettes: draw ghostly silhouette that fades in
+        if (e.warpingIn) {
+            var warpAlpha = clamp(e.warpTimer / e.warpDuration, 0, 1);
+            if (warpAlpha > 0.3) {
+                gameCtx.save();
+                gameCtx.globalAlpha = (warpAlpha - 0.3) * 0.7;
+                gameCtx.translate(e.x, e.y);
+                // Flicker scale
+                var warpScale = 2.0 - warpAlpha;
+                gameCtx.scale(warpScale, warpScale);
+                drawCorvette(e, e.color);
+                gameCtx.restore();
+            }
+            continue;
+        }
+
+        // Corvette chunks — draw burning debris instead of hull
+        if (e.corvetteChunks && e.corvetteChunks.length > 0) {
+            for (var cci = 0; cci < e.corvetteChunks.length; cci++) {
+                var cc = e.corvetteChunks[cci];
+                if (!cc.alive) continue;
+                var ccLife = clamp(cc.life / 800, 0.2, 1);
+                drawGlow(gameCtx, cc.x, cc.y, '#FF4400', 18 + (1 - ccLife) * 10, 0.4 + Math.sin(gameState.time * 0.01 + cci) * 0.15);
+                gameCtx.save();
+                gameCtx.translate(cc.x, cc.y);
+                gameCtx.rotate(cc.rotation);
+                var ccFlk = Math.random();
+                gameCtx.fillStyle = ccFlk > 0.5 ? '#FF2200' : ccFlk > 0.3 ? '#FF4400' : '#CC1100';
+                gameCtx.globalAlpha = 0.85;
+                gameCtx.beginPath();
+                if (cc.vertices.length > 0) {
+                    gameCtx.moveTo(cc.vertices[0].x, cc.vertices[0].y);
+                    for (var ccvi = 1; ccvi < cc.vertices.length; ccvi++) {
+                        gameCtx.lineTo(cc.vertices[ccvi].x, cc.vertices[ccvi].y);
+                    }
+                }
+                gameCtx.closePath();
+                gameCtx.fill();
+                gameCtx.strokeStyle = ccFlk > 0.4 ? '#FFAA00' : '#FF6600';
+                gameCtx.lineWidth = 1.5;
+                gameCtx.globalAlpha = 0.7;
+                gameCtx.stroke();
+                gameCtx.restore();
+            }
+            continue;
+        }
+
         gameCtx.save();
         gameCtx.globalAlpha = e.fadeIn;
         gameCtx.translate(e.x, e.y);
@@ -3823,7 +4521,9 @@ function drawEnemies() {
             drawGlow(gameCtx, 0, 0, drawColor, e.radius + 10, 0.4);
         }
 
-        if (e.type === 'saucer') {
+        if (e.type === 'corvette') {
+            drawCorvette(e, e.elite && !e.dying ? '#FFFFFF' : drawColor);
+        } else if (e.type === 'saucer') {
             drawSaucer(e, e.elite && !e.dying ? '#FFFFFF' : drawColor);
         } else {
             drawFighter(e, e.elite && !e.dying ? '#FFFFFF' : drawColor);
@@ -3832,7 +4532,9 @@ function drawEnemies() {
         // Draw colored core on top for elites so the color still shows
         if (e.elite && !e.dying) {
             gameCtx.globalAlpha *= 0.5;
-            if (e.type === 'saucer') {
+            if (e.type === 'corvette') {
+                drawCorvette(e, drawColor);
+            } else if (e.type === 'saucer') {
                 drawSaucer(e, drawColor);
             } else {
                 drawFighter(e, drawColor);
@@ -3868,7 +4570,9 @@ function drawEnemies() {
 
         drawGlow(gameCtx, 0, 0, drawColor, e.radius + 10 + e.charging * 20, 0.5);
 
-        if (e.type === 'saucer') {
+        if (e.type === 'corvette') {
+            drawCorvette(e, drawColor);
+        } else if (e.type === 'saucer') {
             drawSaucer(e, drawColor);
         } else {
             drawFighter(e, drawColor);
@@ -3951,6 +4655,75 @@ function drawFighter(e, color) {
     gameCtx.lineTo(-hw * 0.5, hw * 0.15);
     gameCtx.closePath();
     gameCtx.fill();
+}
+
+function drawCorvette(e, color) {
+    // Draws at origin — caller has already translated to e.x, e.y
+    var s = e.size * 0.5;
+
+    // Outer hull glow
+    drawGlow(gameCtx, 0, 0, color, s + 15, 0.35);
+
+    // Main hull — angular heavy cruiser shape
+    gameCtx.fillStyle = color;
+    gameCtx.beginPath();
+    gameCtx.moveTo(s * 1.2, 0);            // sharp nose
+    gameCtx.lineTo(s * 0.4, -s * 0.25);    // upper nose bevel
+    gameCtx.lineTo(s * 0.2, -s * 0.55);    // upper wing root
+    gameCtx.lineTo(-s * 0.5, -s * 0.65);   // upper wing tip
+    gameCtx.lineTo(-s * 0.7, -s * 0.4);    // upper rear notch
+    gameCtx.lineTo(-s * 0.9, -s * 0.5);    // upper engine nacelle
+    gameCtx.lineTo(-s * 1.0, -s * 0.2);    // rear top
+    gameCtx.lineTo(-s * 0.8, 0);           // rear center notch
+    gameCtx.lineTo(-s * 1.0, s * 0.2);     // rear bottom
+    gameCtx.lineTo(-s * 0.9, s * 0.5);     // lower engine nacelle
+    gameCtx.lineTo(-s * 0.7, s * 0.4);     // lower rear notch
+    gameCtx.lineTo(-s * 0.5, s * 0.65);    // lower wing tip
+    gameCtx.lineTo(s * 0.2, s * 0.55);     // lower wing root
+    gameCtx.lineTo(s * 0.4, s * 0.25);     // lower nose bevel
+    gameCtx.closePath();
+    gameCtx.fill();
+
+    // Dark hull plating — inner detail
+    gameCtx.fillStyle = '#000000';
+    gameCtx.globalAlpha *= 0.25;
+    gameCtx.beginPath();
+    gameCtx.moveTo(s * 0.8, 0);
+    gameCtx.lineTo(s * 0.1, -s * 0.2);
+    gameCtx.lineTo(-s * 0.4, -s * 0.15);
+    gameCtx.lineTo(-s * 0.4, s * 0.15);
+    gameCtx.lineTo(s * 0.1, s * 0.2);
+    gameCtx.closePath();
+    gameCtx.fill();
+    gameCtx.globalAlpha /= 0.25;
+
+    // Bridge — bright center stripe
+    gameCtx.fillStyle = '#FFFFFF';
+    gameCtx.globalAlpha *= 0.3;
+    gameCtx.beginPath();
+    gameCtx.ellipse(s * 0.15, 0, s * 0.12, s * 0.06, 0, 0, Math.PI * 2);
+    gameCtx.fill();
+    gameCtx.globalAlpha /= 0.3;
+
+    // Engine nacelle glows
+    drawGlow(gameCtx, -s * 0.95, -s * 0.35, color, 8, 0.6);
+    drawGlow(gameCtx, -s * 0.95, s * 0.35, color, 8, 0.6);
+    drawGlow(gameCtx, -s * 0.95, -s * 0.35, '#FFFFFF', 4, 0.8);
+    drawGlow(gameCtx, -s * 0.95, s * 0.35, '#FFFFFF', 4, 0.8);
+
+    // Wing tip accents
+    gameCtx.fillStyle = color;
+    gameCtx.globalAlpha *= 0.6;
+    gameCtx.beginPath();
+    gameCtx.arc(-s * 0.5, -s * 0.65, 2.5, 0, Math.PI * 2);
+    gameCtx.fill();
+    gameCtx.beginPath();
+    gameCtx.arc(-s * 0.5, s * 0.65, 2.5, 0, Math.PI * 2);
+    gameCtx.fill();
+    gameCtx.globalAlpha /= 0.6;
+
+    // Nose accent glow
+    drawGlow(gameCtx, s * 0.9, 0, color, 5, 0.4);
 }
 
 function drawAsteroids() {
@@ -4155,6 +4928,232 @@ function drawHUD() {
     gameCtx.font = '10px monospace';
     gameCtx.textAlign = 'right';
     gameCtx.fillText('SCORE ' + gameState.score, canvasW - 15, canvasH - 15);
+    if (_sessionHighScore > 0) {
+        gameCtx.globalAlpha = 0.2;
+        gameCtx.fillStyle = '#FFFFFF';
+        gameCtx.font = '9px monospace';
+        gameCtx.fillText('HI ' + _sessionHighScore, canvasW - 15, canvasH - 28);
+    }
+
+    // Combo display
+    var lp = gameState.players[0];
+    if (lp && lp.alive) {
+        // Level name
+        gameCtx.textAlign = 'left';
+        gameCtx.globalAlpha = 0.4;
+        gameCtx.fillStyle = lp.color;
+        gameCtx.font = '10px monospace';
+        gameCtx.fillText('L' + lp.level + ' ' + (LEVEL_NAMES[lp.level - 1] || ''), 8, canvasH - 15);
+
+        // Combo multiplier
+        if (lp.combo >= 3) {
+            var comboMult = lp.combo >= 30 ? 6 : lp.combo >= 20 ? 5 : lp.combo >= 15 ? 4 : lp.combo >= 10 ? 3 : lp.combo >= 6 ? 2 : 1.5;
+            var comboAlpha = 0.5;
+            // Blink when about to expire
+            if (lp.comboTimer < 1500 && lp.comboTimer > 0) {
+                comboAlpha = 0.3 + Math.sin(gameState.time * 0.02) * 0.3;
+            }
+            gameCtx.textAlign = 'right';
+            gameCtx.globalAlpha = comboAlpha;
+            gameCtx.fillStyle = comboMult >= 4 ? '#FFCC00' : comboMult >= 2 ? '#FF8800' : '#FFFFFF';
+            gameCtx.font = (comboMult >= 4 ? '14' : comboMult >= 2 ? '12' : '10') + 'px monospace';
+            gameCtx.fillText('x' + comboMult + ' (' + lp.combo + ')', canvasW - 15, canvasH - 30);
+        }
+    }
+
+    // Level-up text flash
+    if (_levelUpTimer > 0) {
+        _levelUpTimer -= 16;
+        var lutAlpha = clamp(_levelUpTimer / 1500, 0, 1);
+        var lutScale = 1 + (1 - lutAlpha) * 0.5;
+        gameCtx.save();
+        gameCtx.textAlign = 'center';
+        gameCtx.globalAlpha = lutAlpha * 0.7;
+        gameCtx.fillStyle = _levelUpColor;
+        gameCtx.font = Math.round(20 * lutScale) + 'px monospace';
+        gameCtx.fillText(_levelUpText, canvasW / 2, canvasH / 2 - 50 - (1 - lutAlpha) * 30);
+        gameCtx.restore();
+    }
+
+    // === NEW HIGH SCORE CELEBRATION ===
+    if (_celebration) {
+        _celebration.timer += 16;
+        if (_celebration.timer >= _celebration.duration) {
+            _celebration = null;
+        } else {
+            var cProgress = _celebration.timer / _celebration.duration;
+
+            // Spawn firework bursts across the screen
+            if (_celebration.timer >= _celebration.nextFirework) {
+                _celebration.nextFirework = _celebration.timer + rand(80, 250);
+                var fwx = rand(canvasW * 0.1, canvasW * 0.9);
+                var fwy = rand(canvasH * 0.15, canvasH * 0.6);
+                var fwColors = ['#FF3366', '#33FF66', '#3366FF', '#FFFF33', '#FF33FF', '#33FFFF', '#FF8800', '#FFFFFF'];
+                var fwColor = randChoice(fwColors);
+                var fwColor2 = randChoice(fwColors);
+                // Firework burst — big expanding ring of particles
+                var fwCount = budgetCount(25, 50);
+                for (var fwi = 0; fwi < fwCount; fwi++) {
+                    var fwa = rand(0, Math.PI * 2);
+                    var fws = rand(2, 8);
+                    spawnParticle({
+                        x: fwx + rand(-3, 3), y: fwy + rand(-3, 3),
+                        vx: Math.cos(fwa) * fws, vy: Math.sin(fwa) * fws,
+                        life: randInt(40, 90), radius: rand(1.5, 4),
+                        color: Math.random() > 0.5 ? fwColor : fwColor2,
+                        type: Math.random() > 0.5 ? 'spark' : 'circle',
+                        angle: fwa, glow: true, shrink: true, friction: 0.96,
+                    });
+                }
+                // Trailing sparkle embers
+                var embCount = budgetCount(10, 20);
+                for (var embi = 0; embi < embCount; embi++) {
+                    var emba = rand(0, Math.PI * 2);
+                    spawnParticle({
+                        x: fwx, y: fwy,
+                        vx: Math.cos(emba) * rand(0.3, 1.5), vy: Math.sin(emba) * rand(0.3, 1.5) + 0.3,
+                        life: randInt(60, 140), radius: rand(0.8, 2),
+                        color: fwColor, type: 'circle', angle: 0,
+                        glow: true, shrink: true, friction: 0.998,
+                    });
+                }
+                spawnRingWave(fwx, fwy, rand(40, 80), rand(2, 4), fwColor);
+                if (Math.random() > 0.5) spawnRingWave(fwx, fwy, rand(25, 50), rand(3, 5), '#FFFFFF');
+                // Light screen effects
+                gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, rand(2, 5));
+            }
+
+            // Spawn flyby fighter ships
+            if (_celebration.timer >= _celebration.nextFlyby) {
+                _celebration.nextFlyby = _celebration.timer + rand(300, 700);
+                var fbSide = Math.random() > 0.5;
+                var fbY = rand(canvasH * 0.2, canvasH * 0.8);
+                _celebration.flybys.push({
+                    x: fbSide ? -40 : canvasW + 40,
+                    y: fbY + rand(-50, 50),
+                    vx: fbSide ? rand(8, 14) : rand(-14, -8),
+                    vy: rand(-0.5, 0.5),
+                    color: randChoice(['#00FFFF', '#FF3366', '#33FF66', '#FFFF33', '#FF33FF']),
+                    size: rand(8, 14),
+                    alive: true,
+                });
+                // Sometimes spawn in formation (2-3 ships)
+                if (Math.random() > 0.4) {
+                    for (var ffi = 0; ffi < randInt(1, 2); ffi++) {
+                        _celebration.flybys.push({
+                            x: (fbSide ? -40 : canvasW + 40) + (fbSide ? -20 : 20) * (ffi + 1),
+                            y: fbY + (ffi + 1) * (Math.random() > 0.5 ? 18 : -18),
+                            vx: fbSide ? rand(8, 14) : rand(-14, -8),
+                            vy: rand(-0.3, 0.3),
+                            color: randChoice(['#00FFFF', '#FF3366', '#33FF66', '#FFFF33']),
+                            size: rand(6, 10),
+                            alive: true,
+                        });
+                    }
+                }
+            }
+
+            // Update and draw flybys
+            for (var fbi = _celebration.flybys.length - 1; fbi >= 0; fbi--) {
+                var fb = _celebration.flybys[fbi];
+                fb.x += fb.vx;
+                fb.y += fb.vy;
+                // Off screen? remove
+                if (fb.x < -80 || fb.x > canvasW + 80) {
+                    _celebration.flybys.splice(fbi, 1);
+                    continue;
+                }
+                // Engine trail
+                for (var fti = 0; fti < budgetCount(1, 3); fti++) {
+                    var ftAngle = Math.atan2(fb.vy, fb.vx) + Math.PI;
+                    spawnParticle({
+                        x: fb.x + Math.cos(ftAngle) * fb.size * 0.5 + rand(-2, 2),
+                        y: fb.y + rand(-2, 2),
+                        vx: Math.cos(ftAngle) * rand(1, 3), vy: Math.sin(ftAngle) * rand(1, 3),
+                        life: randInt(10, 25), radius: rand(1, 2.5),
+                        color: Math.random() > 0.5 ? '#FFFFFF' : fb.color,
+                        glow: true, shrink: true, friction: 0.94,
+                    });
+                }
+                // Draw the flyby ship (small chevron)
+                gameCtx.save();
+                gameCtx.translate(fb.x, fb.y);
+                gameCtx.rotate(Math.atan2(fb.vy, fb.vx));
+                drawGlow(gameCtx, 0, 0, fb.color, fb.size + 5, 0.3);
+                gameCtx.fillStyle = fb.color;
+                gameCtx.globalAlpha = 0.9;
+                gameCtx.beginPath();
+                gameCtx.moveTo(fb.size, 0);
+                gameCtx.lineTo(-fb.size * 0.6, -fb.size * 0.5);
+                gameCtx.lineTo(-fb.size * 0.3, 0);
+                gameCtx.lineTo(-fb.size * 0.6, fb.size * 0.5);
+                gameCtx.closePath();
+                gameCtx.fill();
+                gameCtx.restore();
+            }
+
+            // "NEW HIGH SCORE!" text with pulsing glow
+            gameCtx.save();
+            gameCtx.textAlign = 'center';
+            var nhsAlpha = clamp(cProgress < 0.1 ? cProgress / 0.1 : cProgress > 0.8 ? (1 - cProgress) / 0.2 : 1, 0, 1);
+            var nhsPulse = 1 + Math.sin(_celebration.timer * 0.008) * 0.1;
+            gameCtx.globalAlpha = nhsAlpha * 0.8;
+            gameCtx.fillStyle = '#FFCC00';
+            gameCtx.font = Math.round(22 * nhsPulse) + 'px monospace';
+            gameCtx.fillText('NEW HIGH SCORE!', canvasW / 2, canvasH / 2 - 70);
+            gameCtx.globalAlpha = nhsAlpha * 0.5;
+            gameCtx.fillStyle = '#FFFFFF';
+            gameCtx.font = '14px monospace';
+            gameCtx.fillText('' + _sessionHighScore, canvasW / 2, canvasH / 2 - 48);
+            gameCtx.restore();
+        }
+    }
+
+    // Death stats overlay
+    if (_deathStatsTimer > 0 && _deathStats) {
+        _deathStatsTimer -= 16;
+        var dsAlpha = clamp(_deathStatsTimer / 3000, 0, 1);
+        gameCtx.save();
+        gameCtx.textAlign = 'center';
+        gameCtx.globalAlpha = dsAlpha * 0.6;
+        gameCtx.fillStyle = '#FFFFFF';
+        gameCtx.font = '16px monospace';
+        var dsy = canvasH / 2 - 40;
+        gameCtx.fillText(_deathStats && _deathStats.isNewBest ? 'VICTORY' : 'DESTROYED', canvasW / 2, dsy);
+        gameCtx.font = '10px monospace';
+        gameCtx.globalAlpha = dsAlpha * 0.4;
+        gameCtx.fillText('Level ' + _deathStats.level + ' ' + _deathStats.levelName, canvasW / 2, dsy + 24);
+        gameCtx.fillText('Score: ' + _deathStats.score, canvasW / 2, dsy + 40);
+        if (_deathStats.highScore > _deathStats.score) {
+            gameCtx.fillText('High Score: ' + _deathStats.highScore, canvasW / 2, dsy + 56);
+        }
+        var dsyOff = _deathStats.highScore > _deathStats.score ? 72 : 56;
+        gameCtx.fillText('Best Combo: ' + _deathStats.combo, canvasW / 2, dsy + dsyOff);
+        gameCtx.fillText('Kills: ' + _deathStats.kills, canvasW / 2, dsy + dsyOff + 16);
+        gameCtx.fillText('Time: ' + _deathStats.time + 's', canvasW / 2, dsy + dsyOff + 32);
+        gameCtx.restore();
+    }
+
+    // Score popups
+    for (var spi = _scorePopups.length - 1; spi >= 0; spi--) {
+        var sp = _scorePopups[spi];
+        sp.y -= 0.5;
+        sp.life--;
+        if (sp.life <= 0) { _scorePopups.splice(spi, 1); continue; }
+        gameCtx.save();
+        gameCtx.textAlign = 'center';
+        gameCtx.globalAlpha = clamp(sp.life / 30, 0, 0.6);
+        gameCtx.fillStyle = sp.color;
+        gameCtx.font = '9px monospace';
+        gameCtx.fillText(sp.text, sp.x, sp.y);
+        gameCtx.restore();
+    }
+
+    gameCtx.textAlign = 'left';
+    gameCtx.globalAlpha = 0.2;
+    gameCtx.fillStyle = '#FFFFFF';
+    gameCtx.font = '9px monospace';
+    gameCtx.fillText('v' + GAME_VERSION, 8, 14);
     gameCtx.restore();
 }
 
@@ -4682,6 +5681,9 @@ function serializeState() {
                 shieldRechargeRate: p.shieldRechargeRate,
                 deathTime: p.deathTime,
                 drifting: p.drifting, driftVx: p.driftVx, driftVy: p.driftVy,
+                xp: p.xp, xpToNext: p.xpToNext, combo: p.combo, comboTimer: p.comboTimer, killCount: p.killCount,
+                overdriveTimer: p.overdriveTimer, overdriveActive: p.overdriveActive, overdriveDuration: p.overdriveDuration,
+                wingmen: p.wingmen, voidDrifting: p.voidDrifting || false, voidDriftCooldown: p.voidDriftCooldown || 0,
             };
         }),
         enemies: gameState.enemies.filter(function(e) { return e.alive || e.dying; }).map(function(e) {
@@ -4691,7 +5693,7 @@ function serializeState() {
                 fadeIn: e.fadeIn, shields: e.shields,
                 maxShields: e.maxShields, shieldAngle: e.shieldAngle,
                 rotation: e.rotation, damageFlashTimer: e.damageFlashTimer,
-                charging: e.charging || 0, type: e.type,
+                charging: e.charging || 0, type: e.type, corvetteFireMode: e.corvetteFireMode || null, warpingIn: e.warpingIn || false, warpTimer: e.warpTimer || 0, warpDuration: e.warpDuration || 0,
                 size: e.size, hp: e.hp, elite: e.elite || false,
                 vx: e.vx, vy: e.vy,
                 dirChangeTimer: e.dirChangeTimer,
@@ -4729,6 +5731,7 @@ function serializeState() {
             return {
                 id: b.id, x: b.x, y: b.y, angle: b.angle,
                 trail: b.trail, color: b.color, ownerId: b.ownerId,
+                piercing: b.piercing || 0, homing: b.homing || false,
             };
         }),
         enemyBullets: gameState.enemyBullets.map(function(eb) {
@@ -4874,17 +5877,12 @@ function guestLoop(timestamp) {
         for (var pi = 0; pi < gameState.players.length; pi++) {
             var tp = gameState.players[pi];
             if (!tp || !tp.alive || tp.respawning) continue;
-            for (var si = 0; si < tp.level; si++) {
-                if (tp.level > 1 && Math.random() > 0.5) continue;
-                var etOffset = tp.level === 1 ? 0 : (si - (tp.level - 1) / 2) * 8;
-                var perpA = tp.angle + Math.PI / 2;
-                var trailX = tp.x - Math.cos(tp.angle) * 12 + Math.cos(perpA) * etOffset;
-                var trailY = tp.y - Math.sin(tp.angle) * 12 + Math.sin(perpA) * etOffset;
-                if (tp.drifting) {
-                    driftTrail(trailX, trailY, tp.angle, tp.driftVx, tp.driftVy, tp.color);
-                } else {
-                    engineTrail(trailX, trailY, tp.angle);
-                }
+            var trailX = tp.x - Math.cos(tp.angle) * 12;
+            var trailY = tp.y - Math.sin(tp.angle) * 12;
+            if (tp.drifting) {
+                driftTrail(trailX, trailY, tp.angle, tp.driftVx, tp.driftVy, tp.color);
+            } else {
+                engineTrail(trailX, trailY, tp.angle);
             }
         }
 

@@ -348,8 +348,13 @@ pub fn run() {
                 .resource_dir()
                 .expect("Failed to resolve resource directory");
 
-            let sounds_dir = resource_dir.join("sounds");
-            let index_html = resource_dir.join("index.html");
+            // In dev mode, resource_dir points to target/debug which may have stale copies.
+            // Prefer the source files if they exist (dev), fall back to resource_dir (production).
+            let src_tauri_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let dev_index = src_tauri_dir.join("index.html");
+            let dev_sounds = src_tauri_dir.join("sounds");
+            let index_html = if dev_index.exists() { dev_index } else { resource_dir.join("index.html") };
+            let sounds_dir = if dev_sounds.exists() { dev_sounds } else { resource_dir.join("sounds") };
 
             // Spawn the relay server before the window loads
             tauri::async_runtime::spawn(async move {
