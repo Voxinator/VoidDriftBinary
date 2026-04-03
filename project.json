@@ -1,0 +1,9 @@
+{
+  "name": "Void Drift Binary",
+  "description": "Standalone Tauri desktop build of Void Drift space shooter",
+  "icon": "🚀",
+  "color": "#00FFFF",
+  "tags": ["tool"],
+  "status": "wip",
+  "created": "2026-04-02"
+}

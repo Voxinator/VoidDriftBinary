@@ -1,0 +1,6 @@
+# Build artifacts
+src-tauri/target/
+.DS_Store
+
+# Generated Tauri schemas (regenerated on build)
+src-tauri/gen/
