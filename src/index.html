@@ -682,7 +682,7 @@ document.addEventListener('keydown', function(ev) {
             gameState.paused = !gameState.paused;
         }
     }
-    if (ev.key === '\`') {
+    if (ev.key === '`') {
         _debugMode = !_debugMode;
     }
     if (_debugMode && ev.key >= '1' && ev.key <= '4') {
@@ -820,8 +820,8 @@ function findSafeSpawn() {
     return { x: rand(margin, canvasW - margin), y: rand(margin, canvasH - margin) };
 }
 
-var MAX_PARTICLES = 500;
-var MAX_RING_WAVES = 12;
+var MAX_PARTICLES = 2000;
+var MAX_RING_WAVES = 40;
 
 // Dynamic particle budget: scales emission counts based on current load
 // 1.0 = full fidelity, 0.0 = no new particles
@@ -830,7 +830,7 @@ function updateParticleBudget() {
     var count = gameState.particles.length;
     var fps = _fpsDisplay;
     // Tight budget: throttle early and aggressively to keep gameplay snappy
-    var countPressure = count < 30 ? 1.0 : count < 60 ? 1.0 - (count - 30) / 50 : count < 100 ? 0.2 - (count - 60) / 400 : 0.05;
+    var countPressure = count < 200 ? 1.0 : count < 500 ? 1.0 - (count - 200) / 600 : count < 900 ? 0.3 - (count - 500) / 2000 : 0.1;
     var fpsPressure = fps > 55 ? 1.0 : fps > 45 ? (fps - 45) / 10 : fps > 30 ? 0.1 : 0.03;
     _particleBudget = clamp(Math.min(countPressure, fpsPressure), 0.03, 1.0);
 }
@@ -881,92 +881,111 @@ function spawnRingWave(x, y, maxRadius, expandSpeed, color) {
 }
 
 function engineTrail(x, y, angle) {
-    var count = budgetCount(1, 2);
+    var count = budgetCount(2, 5);
     for (var i = 0; i < count; i++) {
-        var spread = rand(-0.4, 0.4);
-        var spd = rand(1, 3);
+        var spread = rand(-0.5, 0.5);
+        var spd = rand(1.5, 5);
         spawnParticle({
-            x: x + rand(-2, 2),
-            y: y + rand(-2, 2),
+            x: x + rand(-3, 3),
+            y: y + rand(-3, 3),
             vx: Math.cos(angle + Math.PI + spread) * spd,
             vy: Math.sin(angle + Math.PI + spread) * spd,
-            life: randInt(10, 20),
-            radius: rand(1.5, 3),
-            color: i < 2 ? '#FFFFFF' : '#00FFFF',
+            life: randInt(20, 45),
+            radius: rand(1.5, 4),
+            color: i < 1 ? '#FFFFFF' : randChoice(['#00FFFF', '#00CCFF', '#88FFFF']),
             glow: true,
             shrink: true,
-            friction: 0.95,
+            friction: 0.96,
+        });
+    }
+    // Hot core ember
+    if (Math.random() > 0.5) {
+        spawnParticle({
+            x: x, y: y,
+            vx: Math.cos(angle + Math.PI) * rand(0.3, 1),
+            vy: Math.sin(angle + Math.PI) * rand(0.3, 1),
+            life: randInt(30, 60), radius: rand(1, 2),
+            color: '#FFFFFF', glow: true, shrink: true, friction: 0.99,
         });
     }
 }
 
 function driftTrail(x, y, angle, driftVx, driftVy, color) {
-    var count = budgetCount(1, 2);
     var driftAngle = Math.atan2(driftVy, driftVx);
+    var driftSpeed = Math.sqrt(driftVx * driftVx + driftVy * driftVy);
+    var intensity = clamp(driftSpeed / 3, 0.3, 1.0);
+
+    // Main exhaust plume — wide, colorful, lingering
+    var count = budgetCount(4, 8);
     for (var i = 0; i < count; i++) {
-        var spread = rand(-0.6, 0.6);
-        var spd = rand(0.5, 1.5);
+        var spread = rand(-0.7, 0.7);
+        var spd = rand(1, 4) * intensity;
         spawnParticle({
-            x: x + rand(-3, 3),
-            y: y + rand(-3, 3),
+            x: x + rand(-5, 5), y: y + rand(-5, 5),
             vx: Math.cos(driftAngle + Math.PI + spread) * spd,
             vy: Math.sin(driftAngle + Math.PI + spread) * spd,
-            life: randInt(6, 12),
-            radius: rand(1, 2),
-            color: randChoice(['rgba(0,255,255,0.2)', 'rgba(136,255,255,0.25)', 'rgba(255,255,255,0.15)']),
-            glow: false,
-            shrink: true,
-            friction: 0.92,
+            life: randInt(25, 55), radius: rand(1.5, 4),
+            color: randChoice([color, '#FFFFFF', 'rgba(0,255,255,0.5)', 'rgba(136,255,255,0.4)']),
+            glow: Math.random() > 0.3, shrink: true, friction: 0.95,
         });
     }
-    if (Math.random() > 0.6) {
-        var perpAngle = driftAngle + (Math.random() > 0.5 ? Math.PI / 2 : -Math.PI / 2);
+
+    // Drift angle indicator — streak particles showing the actual drift vector
+    var streakCount = budgetCount(2, 5);
+    for (var si = 0; si < streakCount; si++) {
+        var streakSpd = rand(2, 6) * intensity;
         spawnParticle({
-            x: x,
-            y: y,
-            vx: Math.cos(perpAngle) * rand(0.5, 2),
-            vy: Math.sin(perpAngle) * rand(0.5, 2),
-            life: randInt(5, 10),
-            radius: rand(0.8, 1.5),
-            color: color || '#00FFFF',
-            glow: true,
-            shrink: true,
-            friction: 0.9,
+            x: x + rand(-3, 3), y: y + rand(-3, 3),
+            vx: -driftVx * rand(0.3, 0.8) + rand(-0.3, 0.3),
+            vy: -driftVy * rand(0.3, 0.8) + rand(-0.3, 0.3),
+            life: randInt(30, 70), radius: rand(0.8, 2),
+            color: color,
+            type: 'spark', angle: driftAngle + Math.PI,
+            glow: true, shrink: true, friction: 0.97,
+        });
+    }
+
+    // Perpendicular sparks — tire marks that show the sideways slide
+    var slipAngle = Math.abs(angleWrap(angle - driftAngle));
+    if (slipAngle > 0.2) {
+        var perpAngle = driftAngle + Math.PI / 2;
+        var sparkCount = budgetCount(2, 4);
+        for (var pi = 0; pi < sparkCount; pi++) {
+            var side = Math.random() > 0.5 ? 1 : -1;
+            spawnParticle({
+                x: x + rand(-2, 2), y: y + rand(-2, 2),
+                vx: Math.cos(perpAngle * side + rand(-0.4, 0.4)) * rand(1.5, 5),
+                vy: Math.sin(perpAngle * side + rand(-0.4, 0.4)) * rand(1.5, 5),
+                life: randInt(12, 30), radius: rand(0.6, 1.8),
+                color: randChoice([color, '#FFFFFF', '#88FFFF']),
+                type: 'spark', angle: perpAngle * side,
+                glow: true, shrink: true, friction: 0.88,
+            });
+        }
+    }
+
+    // Ghostly trail — slow-fading wisps that linger where you drifted
+    if (Math.random() > 0.3) {
+        spawnParticle({
+            x: x + rand(-8, 8), y: y + rand(-8, 8),
+            vx: rand(-0.15, 0.15), vy: rand(-0.15, 0.15),
+            life: randInt(60, 140), radius: rand(3, 7),
+            color: 'rgba(0,255,255,0.08)',
+            glow: false, shrink: false, friction: 0.999,
         });
     }
 }
 
 function bulletImpact(x, y) {
-    var count = budgetCount(4, 10);
+    var count = budgetCount(8, 18);
     for (var i = 0; i < count; i++) {
         var a = rand(0, Math.PI * 2);
-        var spd = rand(1, 4);
+        var spd = rand(1.5, 6);
         spawnParticle({
-            x, y,
+            x: x + rand(-2, 2), y: y + rand(-2, 2),
             vx: Math.cos(a) * spd,
             vy: Math.sin(a) * spd,
-            life: randInt(10, 15),
-            radius: rand(1, 2.5),
-            color: Math.random() > 0.5 ? '#00FFFF' : '#FFFFFF',
-            type: 'spark',
-            angle: a,
-            glow: true,
-            shrink: true,
-            friction: 0.94,
-        });
-    }
-}
-
-function sparkShield(x, y) {
-    var count = budgetCount(8, 20);
-    for (var i = 0; i < count; i++) {
-        var a = rand(0, Math.PI * 2);
-        var spd = rand(2, 5);
-        spawnParticle({
-            x, y,
-            vx: Math.cos(a) * spd,
-            vy: Math.sin(a) * spd,
-            life: randInt(10, 20),
+            life: randInt(15, 30),
             radius: rand(1, 3),
             color: Math.random() > 0.4 ? '#00FFFF' : '#FFFFFF',
             type: 'spark',
@@ -974,6 +993,38 @@ function sparkShield(x, y) {
             glow: true,
             shrink: true,
             friction: 0.93,
+        });
+    }
+}
+
+function sparkShield(x, y) {
+    var count = budgetCount(15, 35);
+    for (var i = 0; i < count; i++) {
+        var a = rand(0, Math.PI * 2);
+        var spd = rand(2, 7);
+        spawnParticle({
+            x: x + rand(-3, 3), y: y + rand(-3, 3),
+            vx: Math.cos(a) * spd,
+            vy: Math.sin(a) * spd,
+            life: randInt(18, 40),
+            radius: rand(1, 3.5),
+            color: Math.random() > 0.3 ? '#00FFFF' : '#FFFFFF',
+            type: 'spark',
+            angle: a,
+            glow: true,
+            shrink: true,
+            friction: 0.93,
+        });
+    }
+    // Electric arc effect
+    for (var ai = 0; ai < budgetCount(2, 5); ai++) {
+        var aa = rand(0, Math.PI * 2);
+        spawnParticle({
+            x: x, y: y,
+            vx: Math.cos(aa) * rand(3, 8), vy: Math.sin(aa) * rand(3, 8),
+            life: randInt(5, 12), radius: rand(0.5, 1.5),
+            color: '#FFFFFF', type: 'spark', angle: aa,
+            glow: true, shrink: true, friction: 0.88,
         });
     }
 }
@@ -1031,55 +1082,70 @@ function finalExplodeEnemy(e) {
 }
 
 function explodeEnemy(x, y, color) {
-    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, 0.08);
-    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 6);
-    var count = budgetCount(15, 40);
+    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, 0.12);
+    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 10);
+    // Primary burst — hot core
+    var count = budgetCount(40, 100);
     for (var i = 0; i < count; i++) {
         var a = rand(0, Math.PI * 2);
-        var spd = rand(1, 5);
-        var isWhite = Math.random() > 0.6;
+        var spd = rand(2, 10);
+        var isWhite = Math.random() > 0.5;
         spawnParticle({
-            x: x + rand(-4, 4),
-            y: y + rand(-4, 4),
+            x: x + rand(-8, 8),
+            y: y + rand(-8, 8),
             vx: Math.cos(a) * spd,
             vy: Math.sin(a) * spd,
-            life: randInt(30, 60),
-            radius: rand(1.5, 4),
+            life: randInt(45, 110),
+            radius: rand(1.5, 5.5),
             color: isWhite ? '#FFFFFF' : color,
-            type: Math.random() > 0.7 ? 'spark' : 'circle',
+            type: Math.random() > 0.6 ? 'spark' : 'circle',
             angle: a,
             glow: true,
             shrink: true,
-            friction: 0.96,
+            friction: 0.95,
         });
     }
-    for (var d = 0; d < budgetCount(2, 4); d++) {
+    // Secondary slower embers — linger and drift
+    var emberCount = budgetCount(15, 35);
+    for (var ei = 0; ei < emberCount; ei++) {
+        var ea = rand(0, Math.PI * 2);
+        var es = rand(0.3, 2);
+        spawnParticle({
+            x: x + rand(-5, 5), y: y + rand(-5, 5),
+            vx: Math.cos(ea) * es, vy: Math.sin(ea) * es,
+            life: randInt(70, 150), radius: rand(1, 3.5),
+            color: randChoice([color, '#FF8800', '#FFCC00', '#FFFFFF']),
+            type: 'circle', angle: ea, glow: true, shrink: true, friction: 0.995,
+        });
+    }
+    // Debris chunks
+    for (var d = 0; d < budgetCount(3, 6); d++) {
         var da = rand(0, Math.PI * 2);
-        var ds = rand(1, 3);
+        var ds = rand(1, 4);
         var verts = [];
         var nv = randInt(3, 5);
         for (var vi = 0; vi < nv; vi++) {
-            verts.push({ x: rand(-4, 4), y: rand(-4, 4) });
+            verts.push({ x: rand(-5, 5), y: rand(-5, 5) });
         }
         spawnParticle({
             x, y,
             vx: Math.cos(da) * ds,
             vy: Math.sin(da) * ds,
-            life: randInt(30, 50),
-            radius: rand(3, 6),
+            life: randInt(40, 70),
+            radius: rand(3, 7),
             color: color,
             type: 'debris',
             angle: rand(0, Math.PI * 2),
-            angleVel: rand(-0.1, 0.1),
+            angleVel: rand(-0.12, 0.12),
             glow: false,
             shrink: false,
-            friction: 0.99,
+            friction: 0.98,
             vertices: verts,
         });
     }
-    spawnRingWave(x, y, rand(60, 100), rand(2, 4), color);
-    spawnRingWave(x, y, rand(40, 70), rand(3, 5), '#FFFFFF');
-    if (Math.random() > 0.5) spawnRingWave(x, y, rand(30, 50), rand(4, 6), color);
+    spawnRingWave(x, y, rand(70, 120), rand(2, 4), color);
+    spawnRingWave(x, y, rand(50, 90), rand(3, 5), '#FFFFFF');
+    spawnRingWave(x, y, rand(35, 60), rand(4, 6), color);
 }
 
 function tryDropShield(x, y) {
@@ -1108,18 +1174,18 @@ function explodeAsteroid(x, y, size) {
     } else {
         gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 2);
     }
-    var count = size === 'large' ? budgetCount(15, 35) : size === 'medium' ? budgetCount(10, 22) : budgetCount(6, 14);
+    var count = size === 'large' ? budgetCount(30, 70) : size === 'medium' ? budgetCount(18, 40) : budgetCount(10, 22);
     for (var i = 0; i < count; i++) {
         var a = rand(0, Math.PI * 2);
-        var spd = rand(1, 5);
+        var spd = rand(1.5, 7);
         var bright = Math.random() > 0.5;
         spawnParticle({
-            x: x + rand(-6, 6),
-            y: y + rand(-6, 6),
+            x: x + rand(-8, 8),
+            y: y + rand(-8, 8),
             vx: Math.cos(a) * spd,
             vy: Math.sin(a) * spd,
-            life: randInt(25, 50),
-            radius: rand(1.5, 4.5),
+            life: randInt(35, 80),
+            radius: rand(1.5, 5),
             color: bright ? randChoice(['#CCBBAA', '#FFDDBB', '#FFFFFF']) : randChoice(['#AA9977', '#998866', '#BB9955']),
             type: Math.random() > 0.5 ? 'debris' : Math.random() > 0.4 ? 'spark' : 'circle',
             angle: a,
@@ -1140,75 +1206,102 @@ function explodeAsteroid(x, y, size) {
 
 function explodePlayer(x, y) {
     sfxExplosion(x, y, 0.8);
-    var count = budgetCount(20, 50);
-    var colors = ['#FFFFFF', '#00FFFF', '#0088FF', '#00CCFF'];
+    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, 0.3);
+    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 20);
+    // Primary burst
+    var count = budgetCount(40, 90);
+    var colors = ['#FFFFFF', '#00FFFF', '#0088FF', '#00CCFF', '#88FFFF'];
     for (var i = 0; i < count; i++) {
         var a = rand(0, Math.PI * 2);
-        var spd = rand(1, 6);
+        var spd = rand(1.5, 8);
         spawnParticle({
-            x: x + rand(-3, 3),
-            y: y + rand(-3, 3),
+            x: x + rand(-5, 5),
+            y: y + rand(-5, 5),
             vx: Math.cos(a) * spd,
             vy: Math.sin(a) * spd,
-            life: randInt(40, 80),
-            radius: rand(1.5, 4),
+            life: randInt(45, 100),
+            radius: rand(1.5, 5),
             color: randChoice(colors),
-            type: Math.random() > 0.6 ? 'spark' : 'circle',
+            type: Math.random() > 0.5 ? 'spark' : 'circle',
             angle: a,
             glow: true,
             shrink: true,
-            friction: 0.96,
+            friction: 0.95,
         });
     }
-    for (var d = 0; d < budgetCount(2, 5); d++) {
+    // Slow embers
+    var emberCount = budgetCount(15, 30);
+    for (var ei = 0; ei < emberCount; ei++) {
+        var ea = rand(0, Math.PI * 2);
+        spawnParticle({
+            x: x + rand(-3, 3), y: y + rand(-3, 3),
+            vx: Math.cos(ea) * rand(0.2, 1.2), vy: Math.sin(ea) * rand(0.2, 1.2),
+            life: randInt(60, 130), radius: rand(1, 3),
+            color: randChoice(['#00FFFF', '#0088FF', '#FFFFFF']),
+            type: 'circle', angle: ea, glow: true, shrink: true, friction: 0.998,
+        });
+    }
+    // Debris
+    for (var d = 0; d < budgetCount(4, 8); d++) {
         var da = rand(0, Math.PI * 2);
-        var ds = rand(1, 3);
+        var ds = rand(1, 4);
         var verts = [];
         var nv = randInt(3, 5);
         for (var vi = 0; vi < nv; vi++) {
-            verts.push({ x: rand(-5, 5), y: rand(-5, 5) });
+            verts.push({ x: rand(-6, 6), y: rand(-6, 6) });
         }
         spawnParticle({
             x, y,
             vx: Math.cos(da) * ds,
             vy: Math.sin(da) * ds,
-            life: randInt(40, 70),
-            radius: rand(3, 7),
+            life: randInt(50, 90),
+            radius: rand(3, 8),
             color: randChoice(['#00FFFF', '#FFFFFF', '#0088FF']),
             type: 'debris',
             angle: rand(0, Math.PI * 2),
-            angleVel: rand(-0.12, 0.12),
+            angleVel: rand(-0.15, 0.15),
             glow: false,
             shrink: false,
-            friction: 0.99,
+            friction: 0.98,
             vertices: verts,
         });
     }
-    spawnRingWave(x, y, 120, 3, '#00FFFF');
-    spawnRingWave(x, y, 90, 4, '#FFFFFF');
-    spawnRingWave(x, y, 60, 5, '#0088FF');
-    if (Math.random() > 0.5) spawnRingWave(x, y, 50, 6, '#00FFFF');
+    spawnRingWave(x, y, 150, 3, '#00FFFF');
+    spawnRingWave(x, y, 120, 4, '#FFFFFF');
+    spawnRingWave(x, y, 80, 5, '#0088FF');
+    spawnRingWave(x, y, 50, 6, '#00FFFF');
 }
 
 function warpEffect(x, y, phase) {
-    var count = budgetCount(5, 20);
-    var colors = ['#FFFFFF', '#CC88FF', '#8844FF', '#00FFFF'];
+    var count = budgetCount(12, 40);
+    var colors = ['#FFFFFF', '#CC88FF', '#8844FF', '#00FFFF', '#AA66FF', '#88FFFF'];
     for (var i = 0; i < count; i++) {
         var a = rand(0, Math.PI * 2);
-        var spd = phase < 0.5 ? rand(2, 5) : rand(0.5, 2);
+        var spd = phase < 0.5 ? rand(3, 8) : rand(0.5, 3);
         var inward = phase < 0.5 ? -1 : 1;
+        var dist = phase < 0.5 ? rand(50, 120) : rand(5, 20);
         spawnParticle({
-            x: phase < 0.5 ? x + Math.cos(a) * rand(40, 80) : x + rand(-10, 10),
-            y: phase < 0.5 ? y + Math.sin(a) * rand(40, 80) : y + rand(-10, 10),
+            x: phase < 0.5 ? x + Math.cos(a) * dist : x + rand(-15, 15),
+            y: phase < 0.5 ? y + Math.sin(a) * dist : y + rand(-15, 15),
             vx: Math.cos(a) * spd * inward,
             vy: Math.sin(a) * spd * inward,
-            life: randInt(10, 30),
-            radius: rand(1, 3),
+            life: randInt(20, 50),
+            radius: rand(1, 4),
             color: randChoice(colors),
+            type: Math.random() > 0.6 ? 'spark' : 'circle',
+            angle: a,
             glow: true,
             shrink: true,
-            friction: 0.95,
+            friction: 0.94,
         });
+    }
+    // Phase-dependent ring waves
+    if (phase > 0.3 && phase < 0.7) {
+        spawnRingWave(x, y, rand(40, 80), rand(3, 5), '#8844FF');
+    }
+    if (phase >= 0.9) {
+        spawnRingWave(x, y, rand(60, 100), rand(3, 5), '#00FFFF');
+        spawnRingWave(x, y, rand(40, 70), rand(4, 6), '#FFFFFF');
     }
 }
 
@@ -1509,6 +1602,21 @@ function updatePlayers(dt) {
                 p.driftVx = capVx;
                 p.driftVy = capVy;
                 p.driftSteer = 0;
+                // Drift activation burst
+                var driftBurst = budgetCount(15, 30);
+                for (var dbi = 0; dbi < driftBurst; dbi++) {
+                    var dba = rand(0, Math.PI * 2);
+                    var dbs = rand(2, 6);
+                    spawnParticle({
+                        x: p.x + rand(-5, 5), y: p.y + rand(-5, 5),
+                        vx: Math.cos(dba) * dbs, vy: Math.sin(dba) * dbs,
+                        life: randInt(20, 45), radius: rand(1, 3),
+                        color: randChoice([p.color, '#FFFFFF', '#88FFFF']),
+                        type: Math.random() > 0.5 ? 'spark' : 'circle',
+                        angle: dba, glow: true, shrink: true, friction: 0.93,
+                    });
+                }
+                spawnRingWave(p.x, p.y, rand(30, 60), rand(3, 5), p.color);
             }
         }
     } else if (p.drifting) {
@@ -1836,11 +1944,12 @@ function carrierTakeDamage(c, dmg) {
                 // Enter dying state — multi-stage destruction
                 c.dying = true;
                 c.dyingTimer = 0;
-                c.dyingDuration = 4000;
+                c.dyingDuration = 6000;
                 c.nextBoom = 0;
                 c.dyingVx = c.vx * 0.3;
                 c.dyingVy = c.vy * 0.3;
                 c.dyingSpin = c.rotationSpeed * 3;
+                c.dyingFlicker = 0;
                 c.chunks = [];
                 // Enemies retreat immediately
                 for (var ri = 0; ri < gameState.enemies.length; ri++) {
@@ -1885,68 +1994,124 @@ function updateCarriers(dt) {
         c.dyingTimer += dt;
         var progress = c.dyingTimer / c.dyingDuration;
 
-        // Drift and spin
+        // Drift and spin — accelerating rotation
         c.x += c.dyingVx;
         c.y += c.dyingVy;
         c.rotation += c.dyingSpin;
-        c.dyingSpin *= 1.002;
+        c.dyingSpin *= 1.003;
+        c.dyingFlicker = (c.dyingFlicker || 0) + 1;
 
-        // Phase 1 (0-50%): internal explosions ripple across hull
+        // Continuous fire bleeding from hull during entire death
+        if (Math.random() > 0.4) {
+            var fireA = rand(0, Math.PI * 2);
+            var fireR = rand(10, c.radius);
+            spawnParticle({
+                x: c.x + Math.cos(fireA) * fireR, y: c.y + Math.sin(fireA) * fireR,
+                vx: rand(-0.5, 0.5), vy: rand(-1.5, -0.3),
+                life: randInt(20, 50), radius: rand(2, 5),
+                color: randChoice(['#FF2200', '#FF4400', '#FF6600', '#FFAA00']),
+                type: 'circle', angle: 0, glow: true, shrink: true, friction: 0.98,
+            });
+        }
+        // Smoke pouring from the carrier
+        if (Math.random() > 0.5) {
+            spawnParticle({
+                x: c.x + rand(-30, 30), y: c.y + rand(-20, 20),
+                vx: rand(-0.3, 0.3), vy: rand(-0.8, -0.1),
+                life: randInt(50, 120), radius: rand(4, 10),
+                color: 'rgba(40,20,0,0.3)',
+                type: 'circle', angle: 0, glow: false, shrink: false, friction: 0.997,
+            });
+        }
+
+        // Phase 1 (0-50%): internal explosions ripple across hull — increasingly violent
         if (progress < 0.5) {
             if (c.dyingTimer >= c.nextBoom) {
-                var boomInterval = 200 + (1 - progress * 2) * 200;
+                var boomInterval = 120 + (1 - progress * 2) * 180;
                 c.nextBoom = c.dyingTimer + boomInterval;
-                var boomX = c.x + rand(-45, 45);
-                var boomY = c.y + rand(-25, 25);
+                var boomX = c.x + rand(-50, 50);
+                var boomY = c.y + rand(-30, 30);
                 var boomColors = ['#FF0000', '#FF4400', '#FF8800', '#FFCC00', '#FFFFFF'];
-                var boomCount = budgetCount(8, 15);
+                // More particles as death progresses
+                var intensityMult = 1 + progress * 3;
+                var boomCount = budgetCount(15, Math.round(35 * intensityMult));
                 for (var bi = 0; bi < boomCount; bi++) {
                     var ba = rand(0, Math.PI * 2);
-                    var bs = rand(1, 4);
+                    var bs = rand(1.5, 6);
                     spawnParticle({
-                        x: boomX, y: boomY,
+                        x: boomX + rand(-4, 4), y: boomY + rand(-4, 4),
                         vx: Math.cos(ba) * bs, vy: Math.sin(ba) * bs,
-                        life: randInt(20, 40), radius: rand(1.5, 3.5),
+                        life: randInt(25, 55), radius: rand(1.5, 4.5),
                         color: randChoice(boomColors),
-                        type: Math.random() > 0.5 ? 'spark' : 'circle',
-                        angle: ba, glow: true, shrink: true, friction: 0.95,
+                        type: Math.random() > 0.4 ? 'spark' : 'circle',
+                        angle: ba, glow: true, shrink: true, friction: 0.94,
                     });
                 }
-                spawnRingWave(boomX, boomY, rand(30, 60), rand(2, 4), randChoice(['#FF4400', '#FF8800', '#FFFFFF']));
-                gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, rand(5, 12));
-                gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, rand(0.05, 0.15));
-                addExplosionZone(boomX, boomY, rand(60, 100));
+                // Slow embers that linger
+                var emberCount = budgetCount(5, 12);
+                for (var bei = 0; bei < emberCount; bei++) {
+                    var bea = rand(0, Math.PI * 2);
+                    spawnParticle({
+                        x: boomX, y: boomY,
+                        vx: Math.cos(bea) * rand(0.2, 1), vy: Math.sin(bea) * rand(0.2, 1),
+                        life: randInt(60, 120), radius: rand(1, 2.5),
+                        color: randChoice(['#FF4400', '#FF8800', '#FFCC00']),
+                        type: 'circle', angle: bea, glow: true, shrink: true, friction: 0.995,
+                    });
+                }
+                spawnRingWave(boomX, boomY, rand(40, 80), rand(2, 4), randChoice(['#FF4400', '#FF8800', '#FFFFFF']));
+                if (progress > 0.25) spawnRingWave(boomX, boomY, rand(25, 50), rand(3, 5), '#FFFFFF');
+                gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, rand(6, 16));
+                gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, rand(0.06, 0.2));
+                addExplosionZone(boomX, boomY, rand(70, 120));
             }
         }
 
-        // Phase 2 (50%): break apart into chunks
+        // Phase 2 (50%): catastrophic hull breach — break apart into chunks
         if (progress >= 0.5 && c.chunks.length === 0) {
-            gameState.screenFlashAlpha = 0.4;
-            gameState.screenShake.intensity = 25;
-            addExplosionZone(c.x, c.y, 180);
-            spawnRingWave(c.x, c.y, 140, 3, '#FF4400');
-            spawnRingWave(c.x, c.y, 100, 4, '#FFFFFF');
-            // Spawn 5-7 large debris chunks that fly outward
-            var numChunks = randInt(5, 7);
+            gameState.screenFlashAlpha = 0.6;
+            gameState.screenShake.intensity = 40;
+            addExplosionZone(c.x, c.y, 220);
+            spawnRingWave(c.x, c.y, 180, 3, '#FF4400');
+            spawnRingWave(c.x, c.y, 140, 4, '#FFFFFF');
+            spawnRingWave(c.x, c.y, 100, 5, '#FF8800');
+            spawnRingWave(c.x, c.y, 60, 6, '#FFCC00');
+            // Massive shrapnel burst at breakup
+            var breakBurst = budgetCount(40, 80);
+            for (var bbi = 0; bbi < breakBurst; bbi++) {
+                var bba = rand(0, Math.PI * 2);
+                var bbs = rand(2, 8);
+                spawnParticle({
+                    x: c.x + rand(-20, 20), y: c.y + rand(-20, 20),
+                    vx: Math.cos(bba) * bbs, vy: Math.sin(bba) * bbs,
+                    life: randInt(40, 90), radius: rand(2, 5),
+                    color: randChoice(['#FF0000', '#FF4400', '#FF8800', '#FFCC00', '#FFFFFF']),
+                    type: Math.random() > 0.3 ? 'spark' : 'circle',
+                    angle: bba, glow: true, shrink: true, friction: 0.95,
+                });
+            }
+            // Spawn 7-10 large debris chunks that fly outward
+            var numChunks = randInt(7, 10);
             for (var chi = 0; chi < numChunks; chi++) {
                 var ca = (chi / numChunks) * Math.PI * 2 + rand(-0.3, 0.3);
                 var cverts = [];
-                var cnv = randInt(4, 6);
+                var cnv = randInt(4, 7);
                 for (var cvi = 0; cvi < cnv; cvi++) {
-                    cverts.push({ x: rand(-12, 12), y: rand(-8, 8) });
+                    cverts.push({ x: rand(-16, 16), y: rand(-12, 12) });
                 }
                 c.chunks.push({
-                    x: c.x + Math.cos(ca) * rand(10, 25),
-                    y: c.y + Math.sin(ca) * rand(10, 25),
-                    vx: Math.cos(ca) * rand(0.8, 2.5),
-                    vy: Math.sin(ca) * rand(0.8, 2.5),
+                    x: c.x + Math.cos(ca) * rand(10, 30),
+                    y: c.y + Math.sin(ca) * rand(10, 30),
+                    vx: Math.cos(ca) * rand(1, 3.5),
+                    vy: Math.sin(ca) * rand(1, 3.5),
                     rotation: rand(0, Math.PI * 2),
-                    rotSpeed: rand(-0.08, 0.08),
-                    radius: rand(10, 18),
+                    rotSpeed: rand(-0.12, 0.12),
+                    radius: rand(12, 22),
                     vertices: cverts,
                     alive: true,
-                    nextBoom: c.dyingTimer + rand(300, 800),
-                    explodeTime: c.dyingTimer + rand(1200, 1800),
+                    onFire: true,
+                    nextBoom: c.dyingTimer + rand(200, 600),
+                    explodeTime: c.dyingTimer + rand(1500, 2800),
                 });
             }
             // Drop shield pickups
@@ -1972,68 +2137,143 @@ function updateCarriers(dt) {
                 ch.x += ch.vx;
                 ch.y += ch.vy;
                 ch.rotation += ch.rotSpeed;
-                // Trailing fire from chunks
-                if (Math.random() > 0.5) {
+                // Trailing fire from chunks — continuous flame trail
+                for (var tfi = 0; tfi < budgetCount(2, 4); tfi++) {
                     spawnParticle({
-                        x: ch.x + rand(-5, 5), y: ch.y + rand(-5, 5),
-                        vx: rand(-0.5, 0.5), vy: rand(-0.5, 0.5),
-                        life: randInt(10, 20), radius: rand(1, 3),
-                        color: randChoice(['#FF4400', '#FF8800', '#FFCC00']),
-                        type: 'circle', angle: 0, glow: true, shrink: true, friction: 0.97,
+                        x: ch.x + rand(-8, 8), y: ch.y + rand(-8, 8),
+                        vx: -ch.vx * 0.3 + rand(-0.5, 0.5), vy: -ch.vy * 0.3 + rand(-0.5, 0.5),
+                        life: randInt(15, 40), radius: rand(1.5, 4),
+                        color: randChoice(['#FF2200', '#FF4400', '#FF8800', '#FFCC00']),
+                        type: Math.random() > 0.6 ? 'spark' : 'circle',
+                        angle: rand(0, Math.PI * 2), glow: true, shrink: true, friction: 0.97,
                     });
                 }
-                // Mini explosions on chunks
+                // Smoke trail
+                if (Math.random() > 0.4) {
+                    spawnParticle({
+                        x: ch.x + rand(-5, 5), y: ch.y + rand(-5, 5),
+                        vx: rand(-0.3, 0.3), vy: rand(-0.3, 0.3),
+                        life: randInt(40, 80), radius: rand(3, 7),
+                        color: '#442200',
+                        type: 'circle', angle: 0, glow: false, shrink: false, friction: 0.995,
+                    });
+                }
+                // Mini explosions on chunks — more frequent, more violent
                 if (c.dyingTimer >= ch.nextBoom) {
-                    ch.nextBoom = c.dyingTimer + rand(200, 500);
-                    var meCount = budgetCount(5, 10);
+                    ch.nextBoom = c.dyingTimer + rand(120, 350);
+                    var meCount = budgetCount(10, 25);
                     for (var mi = 0; mi < meCount; mi++) {
                         var ma = rand(0, Math.PI * 2);
-                        var mspd = rand(1, 3);
+                        var mspd = rand(1, 5);
                         spawnParticle({
-                            x: ch.x, y: ch.y,
+                            x: ch.x + rand(-3, 3), y: ch.y + rand(-3, 3),
                             vx: Math.cos(ma) * mspd, vy: Math.sin(ma) * mspd,
-                            life: randInt(15, 30), radius: rand(1, 3),
-                            color: randChoice(['#FF4400', '#FF8800', '#FFFFFF']),
-                            type: 'spark', angle: ma, glow: true, shrink: true, friction: 0.95,
+                            life: randInt(20, 45), radius: rand(1.5, 4),
+                            color: randChoice(['#FF2200', '#FF4400', '#FF8800', '#FFCC00', '#FFFFFF']),
+                            type: Math.random() > 0.4 ? 'spark' : 'circle',
+                            angle: ma, glow: true, shrink: true, friction: 0.94,
                         });
                     }
-                    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, rand(3, 8));
-                    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, rand(0.04, 0.1));
-                    sfxExplosion(ch.x, ch.y, 0.3);
+                    spawnRingWave(ch.x, ch.y, rand(25, 50), rand(2, 4), randChoice(['#FF4400', '#FFFFFF']));
+                    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, rand(5, 12));
+                    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, rand(0.06, 0.15));
+                    sfxExplosion(ch.x, ch.y, 0.4);
                 }
-                // Final chunk explosion
+                // Final chunk explosion — each chunk goes out in a blaze
                 if (c.dyingTimer >= ch.explodeTime) {
                     ch.alive = false;
-                    var feCount = budgetCount(15, 25);
+                    var feCount = budgetCount(30, 60);
                     for (var fi = 0; fi < feCount; fi++) {
                         var fa = rand(0, Math.PI * 2);
-                        var fspd = rand(1, 6);
+                        var fspd = rand(1.5, 8);
                         spawnParticle({
-                            x: ch.x, y: ch.y,
+                            x: ch.x + rand(-5, 5), y: ch.y + rand(-5, 5),
                             vx: Math.cos(fa) * fspd, vy: Math.sin(fa) * fspd,
-                            life: randInt(30, 60), radius: rand(2, 5),
+                            life: randInt(35, 80), radius: rand(2, 6),
                             color: randChoice(['#FF0000', '#FF4400', '#FF8800', '#FFCC00', '#FFFFFF']),
-                            type: Math.random() > 0.4 ? 'spark' : 'circle',
-                            angle: fa, glow: true, shrink: true, friction: 0.96,
+                            type: Math.random() > 0.35 ? 'spark' : 'circle',
+                            angle: fa, glow: true, shrink: true, friction: 0.95,
                         });
                     }
-                    spawnRingWave(ch.x, ch.y, rand(50, 80), rand(3, 5), randChoice(['#FF4400', '#FFFFFF']));
-                    addExplosionZone(ch.x, ch.y, rand(80, 120));
-                    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, rand(8, 15));
-                    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, rand(0.1, 0.25));
-                    sfxExplosion(ch.x, ch.y, 0.6);
-                    // Chunk AoE damage
-                    carrierAoE(ch.x, ch.y, 60);
+                    // Debris from each chunk
+                    for (var fdi = 0; fdi < budgetCount(2, 4); fdi++) {
+                        var fda = rand(0, Math.PI * 2);
+                        var fdverts = [];
+                        for (var fdvi = 0; fdvi < randInt(3, 5); fdvi++) fdverts.push({ x: rand(-4, 4), y: rand(-4, 4) });
+                        spawnParticle({
+                            x: ch.x, y: ch.y,
+                            vx: Math.cos(fda) * rand(1, 3), vy: Math.sin(fda) * rand(1, 3),
+                            life: randInt(50, 90), radius: rand(3, 6),
+                            color: randChoice(['#FF4400', '#882200', '#AA4400']),
+                            type: 'debris', angle: rand(0, Math.PI * 2), angleVel: rand(-0.1, 0.1),
+                            glow: false, shrink: false, friction: 0.98, vertices: fdverts,
+                        });
+                    }
+                    spawnRingWave(ch.x, ch.y, rand(60, 100), rand(3, 5), '#FF4400');
+                    spawnRingWave(ch.x, ch.y, rand(40, 70), rand(4, 6), '#FFFFFF');
+                    addExplosionZone(ch.x, ch.y, rand(100, 150));
+                    gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, rand(12, 22));
+                    gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, rand(0.15, 0.35));
+                    sfxExplosion(ch.x, ch.y, 0.7);
+                    carrierAoE(ch.x, ch.y, 80);
                 }
             }
-            // All chunks exploded — final big boom
+            // All chunks exploded — cataclysmic final detonation
             if (!anyAlive) {
                 sfxExplosion(c.x, c.y, 1.0);
-                gameState.screenFlashAlpha = 0.6;
-                gameState.screenShake.intensity = 35;
-                spawnRingWave(c.x, c.y, 200, 3, '#FFFFFF');
-                addExplosionZone(c.x, c.y, 250);
-                carrierAoE(c.x, c.y, 150);
+                // Play a second explosion sound slightly delayed for the shockwave feel
+                setTimeout(function() { var cx = c.x, cy = c.y; sfxExplosion(cx, cy, 0.8); }, 200);
+                gameState.screenFlashAlpha = 1.0;
+                gameState.screenShake.intensity = 60;
+                // Massive expanding ring waves
+                spawnRingWave(c.x, c.y, 300, 3, '#FFFFFF');
+                spawnRingWave(c.x, c.y, 250, 4, '#FF4400');
+                spawnRingWave(c.x, c.y, 200, 5, '#FF8800');
+                spawnRingWave(c.x, c.y, 150, 6, '#FFCC00');
+                spawnRingWave(c.x, c.y, 100, 7, '#FFFFFF');
+                addExplosionZone(c.x, c.y, 350);
+                carrierAoE(c.x, c.y, 200);
+                // Final particle supernova — wall of fire
+                var novaCount = budgetCount(100, 200);
+                for (var ni = 0; ni < novaCount; ni++) {
+                    var na = rand(0, Math.PI * 2);
+                    var nspd = rand(2, 14);
+                    spawnParticle({
+                        x: c.x + rand(-25, 25), y: c.y + rand(-25, 25),
+                        vx: Math.cos(na) * nspd, vy: Math.sin(na) * nspd,
+                        life: randInt(60, 180), radius: rand(2, 7),
+                        color: randChoice(['#FF0000', '#FF4400', '#FF8800', '#FFCC00', '#FFFFFF', '#FFFF88', '#FFEE44']),
+                        type: Math.random() > 0.3 ? 'spark' : 'circle',
+                        angle: na, glow: true, shrink: true, friction: 0.97,
+                    });
+                }
+                // Debris field from the carrier hull
+                for (var ndi = 0; ndi < budgetCount(8, 15); ndi++) {
+                    var nda = rand(0, Math.PI * 2);
+                    var ndverts = [];
+                    for (var ndvi = 0; ndvi < randInt(3, 6); ndvi++) ndverts.push({ x: rand(-8, 8), y: rand(-8, 8) });
+                    spawnParticle({
+                        x: c.x + rand(-20, 20), y: c.y + rand(-20, 20),
+                        vx: Math.cos(nda) * rand(1, 5), vy: Math.sin(nda) * rand(1, 5),
+                        life: randInt(80, 150), radius: rand(4, 10),
+                        color: randChoice(['#FF4400', '#882200', '#AA4400', '#663311']),
+                        type: 'debris', angle: rand(0, Math.PI * 2), angleVel: rand(-0.1, 0.1),
+                        glow: false, shrink: false, friction: 0.98, vertices: ndverts,
+                    });
+                }
+                // Lingering embers that float outward — the dying glow
+                var lingerCount = budgetCount(40, 80);
+                for (var li = 0; li < lingerCount; li++) {
+                    var la = rand(0, Math.PI * 2);
+                    var lspd = rand(0.2, 2);
+                    spawnParticle({
+                        x: c.x + rand(-50, 50), y: c.y + rand(-50, 50),
+                        vx: Math.cos(la) * lspd, vy: Math.sin(la) * lspd,
+                        life: randInt(120, 250), radius: rand(1, 4),
+                        color: randChoice(['#FF4400', '#FF8800', '#FFCC00', '#FF2200', '#FF6600']),
+                        type: 'circle', angle: la, glow: true, shrink: true, friction: 0.998,
+                    });
+                }
                 gameState.carriers.splice(ci, 1);
                 continue;
             }
@@ -2163,9 +2403,14 @@ function updateCarriers(dt) {
         newEnemy.y = c.y;
         newEnemy.elite = true;
         newEnemy.pursuit = true;
-        newEnemy.behavior = 'aggressive';
-        newEnemy.shields = 5;
         newEnemy.hp = 3;
+        if (maxPlayerLevel >= 4) {
+            newEnemy.shields = 3;
+            newEnemy.behavior = 'normal'; // no aggressive until shot
+        } else {
+            newEnemy.shields = 2;
+            newEnemy.behavior = 'normal';
+        }
         // Launch away from barrage direction if active, otherwise toward player
         var launchTarget = findNearestPlayer(c.x, c.y);
         var launchAngle;
@@ -2254,11 +2499,21 @@ function drawCarrier(c) {
         for (var ci = 0; ci < c.chunks.length; ci++) {
             var ch = c.chunks[ci];
             if (!ch.alive) continue;
-            drawGlow(gameCtx, ch.x, ch.y, '#FF4400', 20, 0.4);
+            var chunkLife = 1 - (c.dyingTimer - (c.dyingDuration * 0.5)) / (c.dyingDuration * 0.5);
+            chunkLife = clamp(chunkLife, 0.2, 1);
+
+            // Pulsing fire glow — intensifies as chunk nears explosion
+            var pulseGlow = 0.5 + Math.sin(c.dyingTimer * 0.01 + ci) * 0.2;
+            drawGlow(gameCtx, ch.x, ch.y, '#FF4400', 30 + (1 - chunkLife) * 20, pulseGlow);
+            drawGlow(gameCtx, ch.x, ch.y, '#FF8800', 15, 0.3);
+
             gameCtx.save();
             gameCtx.translate(ch.x, ch.y);
             gameCtx.rotate(ch.rotation);
-            gameCtx.fillStyle = '#FF0000';
+
+            // Molten hull — flickers between red/orange/yellow
+            var chunkFlicker = Math.random();
+            gameCtx.fillStyle = chunkFlicker > 0.6 ? '#FF2200' : chunkFlicker > 0.3 ? '#FF4400' : '#CC1100';
             gameCtx.globalAlpha = 0.9;
             gameCtx.beginPath();
             if (ch.vertices.length > 0) {
@@ -2269,9 +2524,20 @@ function drawCarrier(c) {
             }
             gameCtx.closePath();
             gameCtx.fill();
-            gameCtx.strokeStyle = '#FF8800';
-            gameCtx.lineWidth = 1;
+
+            // Hot edges — glowing orange/yellow cracks
+            gameCtx.strokeStyle = chunkFlicker > 0.5 ? '#FFAA00' : '#FF6600';
+            gameCtx.lineWidth = 2;
+            gameCtx.globalAlpha = 0.8;
             gameCtx.stroke();
+
+            // Inner molten core detail
+            gameCtx.fillStyle = '#FF8800';
+            gameCtx.globalAlpha = 0.4 + Math.sin(c.dyingTimer * 0.02) * 0.2;
+            gameCtx.beginPath();
+            gameCtx.arc(0, 0, ch.radius * 0.3, 0, Math.PI * 2);
+            gameCtx.fill();
+
             gameCtx.restore();
         }
         // Don't draw hull once chunks exist
@@ -2286,10 +2552,21 @@ function drawCarrier(c) {
 
     var drawColor = c.color;
     if (c.damageFlashTimer > 0) drawColor = '#FFFFFF';
-    if (c.dying) drawColor = Math.random() > 0.3 ? '#FF0000' : '#FF8800';
+    if (c.dying) {
+        var dyingP = c.dyingTimer / c.dyingDuration;
+        // Increasingly violent color flicker
+        var flk = Math.random();
+        if (dyingP > 0.35) drawColor = flk > 0.5 ? '#FF0000' : flk > 0.3 ? '#FF4400' : '#FFCC00';
+        else if (dyingP > 0.2) drawColor = flk > 0.6 ? '#FF0000' : '#FF8800';
+        else drawColor = flk > 0.4 ? '#FF0000' : c.color;
+        // Opacity flicker — hull losing structural integrity
+        gameCtx.globalAlpha = 0.7 + Math.random() * 0.3;
+    }
 
     // Main hull - large wedge shape
-    drawGlow(gameCtx, 0, 0, c.color, c.radius + 15, 0.4);
+    var hullGlowSize = c.dying ? c.radius + 15 + Math.sin(c.dyingTimer * 0.015) * 10 : c.radius + 15;
+    var hullGlowColor = c.dying ? '#FF4400' : c.color;
+    drawGlow(gameCtx, 0, 0, hullGlowColor, hullGlowSize, c.dying ? 0.6 : 0.4);
     gameCtx.fillStyle = drawColor;
     gameCtx.globalAlpha = c.fadeIn;
     gameCtx.beginPath();
@@ -2787,6 +3064,9 @@ function checkCollisions() {
                 if (e.shields > 0) {
                     e.shields--;
                     sparkShield(e.x, e.y);
+                    if (e.elite && e.behavior !== 'aggressive') {
+                        e.behavior = 'aggressive';
+                    }
                 } else {
                     e.hp--;
                     if (e.hp <= 0) {
@@ -4086,6 +4366,9 @@ function updateGame(timestamp, mouseX, mouseY, mouseDown) {
     gameState.time = timestamp;
 
     if (gameState.paused) {
+        _perf.start('render:total');
+        renderGame();
+        _perf.end('render:total');
         return gameState.explosionZones;
     }
 
@@ -4163,7 +4446,7 @@ if (!EMBED_MODE) { (function initStarfield() {
   var sfCanvas = document.getElementById('starfield');
   var sfCtx = sfCanvas.getContext('2d');
   var sfW, sfH;
-  var STAR_COUNT = 150;
+  var STAR_COUNT = 250;
   var sfStars = [];
 
   function sfResize() {
@@ -4239,8 +4522,8 @@ if (!EMBED_MODE) { (function initStarfield() {
       if (!sp2 && gameState.players[0]) sp2 = gameState.players[0];
     }
     if (sp2 && sp2.alive) {
-      _shipParallaxX += ((sp2.glideVx || 0) * -8 - _shipParallaxX) * 0.05;
-      _shipParallaxY += ((sp2.glideVy || 0) * -8 - _shipParallaxY) * 0.05;
+      _shipParallaxX += ((sp2.glideVx || 0) * -25 - _shipParallaxX) * 0.08;
+      _shipParallaxY += ((sp2.glideVy || 0) * -25 - _shipParallaxY) * 0.08;
     } else {
       _shipParallaxX *= 0.95;
       _shipParallaxY *= 0.95;
@@ -4257,10 +4540,23 @@ if (!EMBED_MODE) { (function initStarfield() {
         drawOpacity = s.opacity * (0.4 + 0.6 * ((twinkleVal - 0.6) / 0.4));
       }
 
-      sfCtx.beginPath();
-      sfCtx.arc(px, py, s.r, 0, Math.PI * 2);
+      var streakLen = Math.sqrt(_shipParallaxX * _shipParallaxX + _shipParallaxY * _shipParallaxY) * s.depth * 0.15;
       sfCtx.fillStyle = 'rgba(255,255,255,' + drawOpacity + ')';
-      sfCtx.fill();
+      if (streakLen > 1.5) {
+        // Draw elongated streak in direction of movement
+        var streakAngle = Math.atan2(_shipParallaxY, _shipParallaxX);
+        sfCtx.save();
+        sfCtx.translate(px, py);
+        sfCtx.rotate(streakAngle);
+        sfCtx.beginPath();
+        sfCtx.ellipse(0, 0, s.r + streakLen, s.r * 0.6, 0, 0, Math.PI * 2);
+        sfCtx.fill();
+        sfCtx.restore();
+      } else {
+        sfCtx.beginPath();
+        sfCtx.arc(px, py, s.r, 0, Math.PI * 2);
+        sfCtx.fill();
+      }
 
       // Vary speed by depth: deeper stars move slower
       s.y += s.speed * (0.5 + s.depth * 0.5);
@@ -4273,12 +4569,44 @@ if (!EMBED_MODE) { (function initStarfield() {
 })(); }
 
 // === SECTION: Shared Mouse Handler ===
-var sharedMouseX = 0, sharedMouseY = 0;
+var sharedMouseX = WORLD_W / 2, sharedMouseY = WORLD_H / 2;
 var sharedMouseNX = 0, sharedMouseNY = 0;
 var starfieldMouseX = 0, starfieldMouseY = 0;
 var _shipParallaxX = 0, _shipParallaxY = 0;
 var mouseInWindow = true;
 var sharedMouseDown = false;
+
+// --- WASD keyboard controls ---
+var _wasdKeys = { w: false, a: false, s: false, d: false, space: false };
+var _wasdActive = false;
+document.addEventListener('keydown', function(e) {
+    var k = e.key.toLowerCase();
+    if (k === 'w' || k === 'a' || k === 's' || k === 'd') { _wasdKeys[k] = true; _wasdActive = true; e.preventDefault(); }
+    if (k === ' ') { _wasdKeys.space = true; sharedMouseDown = true; e.preventDefault(); }
+});
+document.addEventListener('keyup', function(e) {
+    var k = e.key.toLowerCase();
+    if (k === 'w' || k === 'a' || k === 's' || k === 'd') { _wasdKeys[k] = false; }
+    if (k === ' ') { _wasdKeys.space = false; sharedMouseDown = false; }
+});
+function updateWASD() {
+    if (!_wasdActive) return;
+    var spd = 12;
+    var dx = 0, dy = 0;
+    if (_wasdKeys.w) dy -= spd;
+    if (_wasdKeys.s) dy += spd;
+    if (_wasdKeys.a) dx -= spd;
+    if (_wasdKeys.d) dx += spd;
+    if (dx !== 0 || dy !== 0) {
+        sharedMouseX = clamp(sharedMouseX + dx, 0, WORLD_W);
+        sharedMouseY = clamp(sharedMouseY + dy, 0, WORLD_H);
+        sharedMouseNX = sharedMouseX / WORLD_W;
+        sharedMouseNY = 1.0 - (sharedMouseY / WORLD_H);
+        starfieldMouseX = (sharedMouseNX - 0.5) * 2;
+        starfieldMouseY = (sharedMouseNY - 0.5) * 2 * -1;
+        mouseInWindow = true;
+    }
+}
 
 document.addEventListener('mousedown', function(e) {
     if (e.button === 0) sharedMouseDown = true;
@@ -4522,6 +4850,7 @@ function diffAndTriggerEffects(prev, curr) {
 
 function guestLoop(timestamp) {
     if (role !== 'guest') return;
+    updateWASD();
 
     // Send input to server
     wsEmit('input', { mouseX: sharedMouseX, mouseY: sharedMouseY, mouseDown: sharedMouseDown });
@@ -4573,6 +4902,7 @@ function guestLoop(timestamp) {
 // === SECTION: Master Game Loop ===
 function masterLoop(timestamp) {
     if (role !== 'host') return;
+    updateWASD();
 
     var explosionZones = updateGame(timestamp, sharedMouseX, sharedMouseY, sharedMouseDown);
 
