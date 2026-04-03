@@ -24,10 +24,27 @@ Three files must stay in sync:
 After editing `src/index.html`, copy to `src-tauri/index.html` before building.
 
 ## Build Workflow
+
+### Local dev build
 ```bash
 cp src/index.html src-tauri/index.html
 cargo tauri build
 ```
+
+### Cross-platform release (macOS + Windows)
+A GitHub Actions workflow (`.github/workflows/build.yml`) builds both platforms automatically. It uses `tauri-apps/tauri-action` with a matrix strategy: macOS universal binary (ARM + Intel) and Windows x86_64.
+
+**To cut a release:**
+1. Update version in all three files (see Version Management above)
+2. Copy frontend: `cp src/index.html src-tauri/index.html`
+3. Commit and push to `main`
+4. Tag and push: `git tag vX.Y.Z && git push origin main --tags`
+5. GitHub Actions builds both platforms and creates a **draft release** with installers attached
+6. Review and publish the draft at https://github.com/Voxinator/VoidDriftBinary/releases
+
+The workflow can also be triggered manually from the Actions tab (workflow_dispatch).
+
+**No Windows machine is needed** — GitHub Actions builds the Windows `.msi`/`.exe` on a Windows runner. All development and releases can be done from the Mac.
 
 ## Port
 Uses port 3800 for WebSocket relay and static file serving. Port 3737 reserved for Project Home.
