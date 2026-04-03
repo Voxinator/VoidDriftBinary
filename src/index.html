@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>Void Drift</title>
 <style>
   :root {
@@ -40,7 +40,7 @@
   #starfield {
     position: fixed;
     top: 0; left: 0;
-    width: 100%; height: 100%;
+    width: 100vw; height: 100vh;
     z-index: 1;
     pointer-events: none;
   }
@@ -227,6 +227,11 @@
 
 <script>
 var EMBED_MODE = false;
+var WORLD_W = 1920;
+var WORLD_H = 1080;
+
+// --- Mobile: render at desktop resolution, CSS-scale to fit ---
+
 // === Visibility API ===
 document.addEventListener('visibilitychange', function() {
     if (document.hidden) {
@@ -234,8 +239,8 @@ document.addEventListener('visibilitychange', function() {
     } else {
         gameState.paused = false;
         if (gameState.players && gameState.players[0]) {
-            _plasma.followX = gameState.players[0].x / window.innerWidth;
-            _plasma.followY = 1.0 - (gameState.players[0].y / window.innerHeight);
+            _plasma.followX = gameState.players[0].x / WORLD_W;
+            _plasma.followY = 1.0 - (gameState.players[0].y / WORLD_H);
         }
     }
 });
@@ -521,8 +526,8 @@ function initPlasma() {
 function resizePlasma() {
   var canvas = _plasma.canvas;
   if (!canvas || !_plasma.gl) return;
-  var w = Math.floor(window.innerWidth * 0.5);
-  var h = Math.floor(window.innerHeight * 0.5);
+  var w = Math.floor(WORLD_W * 0.5);
+  var h = Math.floor(WORLD_H * 0.5);
   canvas.width = w;
   canvas.height = h;
   _plasma.gl.viewport(0, 0, w, h);
@@ -1441,6 +1446,7 @@ function updatePlayers(dt) {
             var spawn = findSafeSpawn();
             p.x = spawn.x;
             p.y = spawn.y;
+            sfxAt('warp-in', p.x, p.y);
         }
         if (p.respawning) {
             p.respawnTimer += dt;
@@ -4041,10 +4047,13 @@ function renderGame() {
 function initGame(canvasElement) {
     gameCanvas = canvasElement;
     gameCtx = gameCanvas.getContext('2d');
-    canvasW = gameCanvas.width = window.innerWidth;
-    canvasH = gameCanvas.height = window.innerHeight;
+    canvasW = gameCanvas.width = WORLD_W;
+    canvasH = gameCanvas.height = WORLD_H;
 
-    gameState.players = [createPlayer(0)];
+    var p0 = createPlayer(0);
+    p0.alive = false;
+    p0.deathTime = Infinity;
+    gameState.players = [p0];
     gameState.enemies = [];
     gameState.asteroids = [];
     gameState.bullets = [];
@@ -4158,8 +4167,8 @@ if (!EMBED_MODE) { (function initStarfield() {
   var sfStars = [];
 
   function sfResize() {
-    sfW = sfCanvas.width = window.innerWidth;
-    sfH = sfCanvas.height = window.innerHeight;
+    sfW = sfCanvas.width = WORLD_W;
+    sfH = sfCanvas.height = WORLD_H;
   }
   sfResize();
   window.addEventListener('resize', sfResize);
@@ -4279,13 +4288,29 @@ document.addEventListener('mouseup', function(e) {
 });
 
 document.addEventListener('mousemove', function(e) {
-    sharedMouseX = e.clientX;
-    sharedMouseY = e.clientY;
+    sharedMouseX = e.clientX * (WORLD_W / window.innerWidth);
+    sharedMouseY = e.clientY * (WORLD_H / window.innerHeight);
     sharedMouseNX = e.clientX / window.innerWidth;
     sharedMouseNY = 1.0 - (e.clientY / window.innerHeight);
     starfieldMouseX = (e.clientX / window.innerWidth - 0.5) * 2;
     starfieldMouseY = (e.clientY / window.innerHeight - 0.5) * 2;
     mouseInWindow = true;
+
+// --- Touch support (mobile) ---
+function handleTouch(e) {
+    var t = e.touches[0];
+    sharedMouseX = t.clientX * (WORLD_W / window.innerWidth);
+    sharedMouseY = t.clientY * (WORLD_H / window.innerHeight);
+    sharedMouseNX = t.clientX / window.innerWidth;
+    sharedMouseNY = 1.0 - (t.clientY / window.innerHeight);
+    starfieldMouseX = (t.clientX / window.innerWidth - 0.5) * 2;
+    starfieldMouseY = (t.clientY / window.innerHeight - 0.5) * 2;
+    mouseInWindow = true;
+    e.preventDefault();
+}
+document.addEventListener('touchstart', function(e) { sharedMouseDown = true; handleTouch(e); }, { passive: false });
+document.addEventListener('touchmove', handleTouch, { passive: false });
+document.addEventListener('touchend', function(e) { sharedMouseDown = false; });
 });
 
 document.addEventListener('mouseleave', function() {
@@ -4592,8 +4617,8 @@ wsOn('role', function(data) {
         // Guest — canvas setup only, wait for state
         gameCanvas = document.getElementById('game-canvas');
         gameCtx = gameCanvas.getContext('2d');
-        canvasW = gameCanvas.width = window.innerWidth;
-        canvasH = gameCanvas.height = window.innerHeight;
+        canvasW = gameCanvas.width = WORLD_W;
+        canvasH = gameCanvas.height = WORLD_H;
         requestAnimationFrame(guestLoop);
     }
 });
@@ -4646,8 +4671,8 @@ wsOn('promote-to-host', function(data) {
     if (!gameCanvas) {
         gameCanvas = document.getElementById('game-canvas');
         gameCtx = gameCanvas.getContext('2d');
-        canvasW = gameCanvas.width = window.innerWidth;
-        canvasH = gameCanvas.height = window.innerHeight;
+        canvasW = gameCanvas.width = WORLD_W;
+        canvasH = gameCanvas.height = WORLD_H;
     }
     if (data.state) {
         applyRemoteState(data.state);
@@ -4683,10 +4708,10 @@ function startAll() {
 window.addEventListener('resize', function() {
     if (!EMBED_MODE) resizePlasma();
     var gc = document.getElementById('game-canvas');
-    gc.width = window.innerWidth;
-    gc.height = window.innerHeight;
-    canvasW = window.innerWidth;
-    canvasH = window.innerHeight;
+    gc.width = WORLD_W;
+    gc.height = WORLD_H;
+    canvasW = WORLD_W;
+    canvasH = WORLD_H;
 });
 
 startAll();
@@ -4714,6 +4739,7 @@ var _sfxFiles = {
     'explosion5': '/sounds/Sci-fi  Spaceship Explosion (4).mp3',
     'explosion6': '/sounds/Sci-fi  Spaceship Explosion (5).mp3',
     'shield-pickup': '/sounds/Sci-fi  Electric Shield Charge Up.mp3',
+    'warp-in': '/sounds/Loud Sci-fi Space Ship Phase Warping Into This Reality.mp3',
 };
 
 function initAudio() {
@@ -4847,6 +4873,11 @@ document.getElementById('playBtn').addEventListener('click', function(e) {
     setTimeout(function() { splash.style.display = 'none'; }, 600);
     initAudio();
     startMusic();
+    // Trigger player warp-in
+    var p = gameState.players[0];
+    if (p && !p.alive) {
+        p.deathTime = 0;
+    }
 });
 document.getElementById('splashScreen').addEventListener('click', function() {
     document.getElementById('playBtn').click();

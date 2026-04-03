@@ -11,8 +11,8 @@
       {
         "title": "Void Drift",
         "url": "http://localhost:3800",
-        "width": 1280,
-        "height": 800,
+        "width": 1920,
+        "height": 1080,
         "resizable": true,
         "fullscreen": false
       }
