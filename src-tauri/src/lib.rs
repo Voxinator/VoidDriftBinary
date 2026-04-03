@@ -63,7 +63,17 @@ impl WsOutMessage {
 
 async fn serve_index(State(state): State<AppState>) -> impl IntoResponse {
     match tokio::fs::read_to_string(&state.index_html).await {
-        Ok(contents) => axum::response::Html(contents).into_response(),
+        Ok(contents) => (
+            [
+                (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (
+                    axum::http::header::CONTENT_SECURITY_POLICY,
+                    "default-src * 'self' 'unsafe-inline' 'unsafe-eval' data: blob: ws: wss: http: https:; img-src * data: blob: 'self'; media-src * 'self' http: https:; connect-src * ws: wss: http: https:;",
+                ),
+            ],
+            axum::response::Html(contents),
+        )
+            .into_response(),
         Err(_) => (
             axum::http::StatusCode::NOT_FOUND,
             "index.html not found",
@@ -339,7 +349,7 @@ pub fn run() {
                 .expect("Failed to resolve resource directory");
 
             let sounds_dir = resource_dir.join("sounds");
-            let index_html = resource_dir.join("src").join("index.html");
+            let index_html = resource_dir.join("index.html");
 
             // Spawn the relay server before the window loads
             tauri::async_runtime::spawn(async move {
