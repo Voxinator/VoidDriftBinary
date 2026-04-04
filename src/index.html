@@ -60,10 +60,7 @@
 <div id="crt-overlay"></div>
 <div id="vignette-overlay"></div>
 <style>
-  /* Neon color pop — boost saturation and contrast on game layer */
-  #game-canvas {
-    filter: saturate(1.3) contrast(1.08) brightness(1.05);
-  }
+  /* Neon color pop — CSS filter removed (compositing cost > visual benefit) */
 
   /* CRT scanlines */
   #crt-overlay {
@@ -227,7 +224,7 @@
 
 <script>
 var EMBED_MODE = false;
-var GAME_VERSION = '0.3.3';
+var GAME_VERSION = '0.4.0';
 var XP_THRESHOLDS = [30, 50, 80, 110, 150, 200, 260, 330, 420];
 var LEVEL_NAMES = ['Scout','Gunner','Ace','Vanguard','Striker','Predator','Warden','Tempest','Sovereign','Void Walker'];
 var _levelUpText = '';
@@ -649,7 +646,20 @@ function wsConnect() {
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   _ws = new WebSocket(proto + '//' + location.host + '/ws');
   _ws.onopen = function() { console.log('WS connected'); };
-  _ws.onclose = function() { console.log('WS disconnected'); setTimeout(wsConnect, 2000); };
+  _ws.onclose = function() {
+    console.log('WS disconnected');
+    _interpBuffer = [];
+    _interpLastApplied = null;
+    _lastGuestState = null;
+    _bulletTrailCache = {};
+    _eBulletTrailCache = {};
+    prevRemoteState = null;
+    remoteState = null;
+    _guestLoopRunning = false;
+    _masterLoopRunning = false;
+    _predictedPlayer = null;
+    setTimeout(wsConnect, 2000);
+  };
   _ws.onmessage = function(ev) {
     try {
       var msg = JSON.parse(ev.data);
@@ -675,8 +685,25 @@ var myColorIndex = 0;
 var role = null; // 'host' or 'guest'
 var guestInputs = {}; // playerId -> { mouseX, mouseY, mouseDown }
 var remoteState = null; // latest state received (for guests)
+var _lastStateSend = 0; // throttle host state broadcasts to ~20Hz
 var prevRemoteState = null; // for diffing to trigger effects
+var _guestLoopRunning = false;
+var _masterLoopRunning = false;
+var _lastInputSend = 0;
+
+// --- Client-side interpolation buffer (smooths WiFi jitter for guests) ---
+var _interpBuffer = [];      // ring of { state, time } snapshots
+var _interpDelay = 100;      // ms to render behind latest received state
+var _interpLastApplied = null; // last state we diffed for effects
+var _lastGuestState = null;   // best available state for fallback rendering
+var _bulletTrailCache = {};   // id -> [{x,y}, ...] — reconstruct trails on guest
+var _eBulletTrailCache = {};  // id -> [{x,y}, ...] — reconstruct trails on guest
+var _externalRaf = false;     // when true, sfDraw skips its own requestAnimationFrame
 var playerMap = {}; // socketId -> player entity id
+
+// --- Client-side prediction for guest's local player ---
+var _predictedPlayer = null;  // locally predicted state for the guest's own ship
+var _predictionSmoothing = 0.15; // blend rate toward server position
 
 var _fpsFrames = 0, _fpsLastTime = 0, _fpsDisplay = 60;
 
@@ -773,6 +800,118 @@ var canvasW = 0;
 var canvasH = 0;
 
 function lerp(a, b, t) { return a + (b - a) * t; }
+function lerpAngle(a, b, t) {
+    var d = b - a;
+    while (d > Math.PI) d -= 2 * Math.PI;
+    while (d < -Math.PI) d += 2 * Math.PI;
+    return a + d * t;
+}
+
+// Interpolate between two network snapshots for smooth guest rendering
+function interpolateStates(stateA, stateB, t) {
+    t = Math.max(0, Math.min(1, t));
+    var out = {};
+    var i;
+
+    // Build O(1) lookup maps from stateA
+    var playerMapA = {};
+    for (i = 0; i < stateA.players.length; i++) playerMapA[stateA.players[i].id] = stateA.players[i];
+    var enemyMapA = {};
+    for (i = 0; i < stateA.enemies.length; i++) enemyMapA[stateA.enemies[i].id] = stateA.enemies[i];
+    var carrierMapA = {};
+    for (i = 0; i < stateA.carriers.length; i++) carrierMapA[stateA.carriers[i].id] = stateA.carriers[i];
+    var asteroidMapA = {};
+    for (i = 0; i < stateA.asteroids.length; i++) asteroidMapA[stateA.asteroids[i].id] = stateA.asteroids[i];
+    var bulletMapA = {};
+    for (i = 0; i < stateA.bullets.length; i++) bulletMapA[stateA.bullets[i].id] = stateA.bullets[i];
+    var enemyBulletMapA = {};
+    for (i = 0; i < stateA.enemyBullets.length; i++) enemyBulletMapA[stateA.enemyBullets[i].id] = stateA.enemyBullets[i];
+
+    // Players — lerp positions and angles, snap discrete fields
+    out.players = stateB.players.map(function(pb) {
+        var pa = playerMapA[pb.id];
+        if (!pa) return pb;
+        var p = {};
+        for (var k in pb) p[k] = pb[k];
+        p.x = lerp(pa.x, pb.x, t);
+        p.y = lerp(pa.y, pb.y, t);
+        p.angle = lerpAngle(pa.angle, pb.angle, t);
+        p.opacity = lerp(pa.opacity, pb.opacity, t);
+        p.scale = lerp(pa.scale, pb.scale, t);
+        p.shieldAngle = lerpAngle(pa.shieldAngle, pb.shieldAngle, t);
+        return p;
+    });
+
+    // Enemies — lerp positions
+    out.enemies = stateB.enemies.map(function(eb) {
+        var ea = enemyMapA[eb.id];
+        if (!ea) return eb;
+        var e = {};
+        for (var k in eb) e[k] = eb[k];
+        e.x = lerp(ea.x, eb.x, t);
+        e.y = lerp(ea.y, eb.y, t);
+        e.rotation = lerpAngle(ea.rotation, eb.rotation, t);
+        e.shieldAngle = lerpAngle(ea.shieldAngle, eb.shieldAngle, t);
+        return e;
+    });
+
+    // Carriers — lerp positions
+    out.carriers = stateB.carriers.map(function(cb) {
+        var ca = carrierMapA[cb.id];
+        if (!ca) return cb;
+        var c = {};
+        for (var k in cb) c[k] = cb[k];
+        c.x = lerp(ca.x, cb.x, t);
+        c.y = lerp(ca.y, cb.y, t);
+        c.rotation = lerpAngle(ca.rotation, cb.rotation, t);
+        c.shieldAngle = lerpAngle(ca.shieldAngle, cb.shieldAngle, t);
+        return c;
+    });
+
+    // Asteroids — lerp positions and rotation
+    out.asteroids = stateB.asteroids.map(function(ab) {
+        var aa = asteroidMapA[ab.id];
+        if (!aa) return ab;
+        var a = {};
+        for (var k in ab) a[k] = ab[k];
+        a.x = lerp(aa.x, ab.x, t);
+        a.y = lerp(aa.y, ab.y, t);
+        a.rotation = lerpAngle(aa.rotation, ab.rotation, t);
+        return a;
+    });
+
+    // Bullets — lerp positions (fast-moving, short-lived)
+    out.bullets = stateB.bullets.map(function(bb) {
+        var ba = bulletMapA[bb.id];
+        if (!ba) return bb;
+        var b = {};
+        for (var k in bb) b[k] = bb[k];
+        b.x = lerp(ba.x, bb.x, t);
+        b.y = lerp(ba.y, bb.y, t);
+        return b;
+    });
+
+    // Enemy bullets — lerp positions
+    out.enemyBullets = stateB.enemyBullets.map(function(ebb) {
+        var eba = enemyBulletMapA[ebb.id];
+        if (!eba) return ebb;
+        var eb = {};
+        for (var k in ebb) eb[k] = ebb[k];
+        eb.x = lerp(eba.x, ebb.x, t);
+        eb.y = lerp(eba.y, ebb.y, t);
+        return eb;
+    });
+
+    // Lasers, pickups, explosion zones, score, time — use latest (stateB)
+    out.lasers = stateB.lasers;
+    out.shieldPickups = stateB.shieldPickups;
+    out.explosionZones = stateB.explosionZones;
+    out.score = stateB.score;
+    out.time = stateB.time;
+
+    return out;
+}
+
 function gameDist(x1, y1, x2, y2) { return Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2); }
 function rand(min, max) { return Math.random() * (max - min) + min; }
 function randInt(min, max) { return Math.floor(rand(min, max + 1)); }
@@ -5562,8 +5701,10 @@ if (!EMBED_MODE) { (function initStarfield() {
       if (s.y > sfH + s.r) { s.y = -s.r; s.x = Math.random() * sfW; }
     }
     _perf.end('draw:starfield');
-    requestAnimationFrame(sfDraw);
+    if (!_externalRaf) requestAnimationFrame(sfDraw);
   }
+  // Expose sfDraw globally so game loops can call it directly
+  window._sfDraw = sfDraw;
   requestAnimationFrame(sfDraw);
 })(); }
 
@@ -5680,7 +5821,7 @@ function serializeState() {
                 shieldRechargeTimer: p.shieldRechargeTimer,
                 shieldRechargeRate: p.shieldRechargeRate,
                 deathTime: p.deathTime,
-                drifting: p.drifting, driftVx: p.driftVx, driftVy: p.driftVy,
+                drifting: p.drifting, driftVx: p.driftVx, driftVy: p.driftVy, glideVx: p.glideVx || 0, glideVy: p.glideVy || 0,
                 xp: p.xp, xpToNext: p.xpToNext, combo: p.combo, comboTimer: p.comboTimer, killCount: p.killCount,
                 overdriveTimer: p.overdriveTimer, overdriveActive: p.overdriveActive, overdriveDuration: p.overdriveDuration,
                 wingmen: p.wingmen, voidDrifting: p.voidDrifting || false, voidDriftCooldown: p.voidDriftCooldown || 0,
@@ -5719,6 +5860,7 @@ function serializeState() {
                 id: car.id, x: car.x, y: car.y,
                 radius: car.radius, rotation: car.rotation,
                 alive: car.alive, dying: car.dying,
+                dyingTimer: car.dyingTimer || 0, dyingDuration: car.dyingDuration || 6000,
                 hp: car.hp, maxHp: car.maxHp,
                 shields: car.shields, maxShields: car.maxShields,
                 shieldAngle: car.shieldAngle, fadeIn: car.fadeIn,
@@ -5730,14 +5872,14 @@ function serializeState() {
         bullets: gameState.bullets.map(function(b) {
             return {
                 id: b.id, x: b.x, y: b.y, angle: b.angle,
-                trail: b.trail, color: b.color, ownerId: b.ownerId,
+                color: b.color, ownerId: b.ownerId,
                 piercing: b.piercing || 0, homing: b.homing || false,
             };
         }),
         enemyBullets: gameState.enemyBullets.map(function(eb) {
             return {
                 id: eb.id, x: eb.x, y: eb.y, radius: eb.radius,
-                color: eb.color, trail: eb.trail, pulsePhase: eb.pulsePhase,
+                color: eb.color, pulsePhase: eb.pulsePhase,
                 vx: eb.vx, vy: eb.vy,
             };
         }),
@@ -5763,6 +5905,7 @@ function serializeState() {
         time: gameState.time,
         nextEntityId: _nextEntityId,
         spawnTimers: gameState.spawnTimers,
+        hostTime: performance.now(),
     };
 }
 
@@ -5779,6 +5922,31 @@ function applyRemoteState(state) {
     gameState.explosionZones = state.explosionZones;
     gameState.score = state.score;
     gameState.time = state.time;
+
+    // Reconstruct bullet trails from position history (stripped from serialization)
+    var seenBullets = {};
+    for (var bi = 0; bi < gameState.bullets.length; bi++) {
+        var b = gameState.bullets[bi];
+        seenBullets[b.id] = true;
+        if (!_bulletTrailCache[b.id]) _bulletTrailCache[b.id] = [];
+        var tc = _bulletTrailCache[b.id];
+        tc.push({x: b.x, y: b.y});
+        if (tc.length > 5) tc.shift();
+        b.trail = tc;
+    }
+    for (var bk in _bulletTrailCache) { if (!seenBullets[bk]) delete _bulletTrailCache[bk]; }
+
+    var seenEBullets = {};
+    for (var ebi = 0; ebi < gameState.enemyBullets.length; ebi++) {
+        var eb = gameState.enemyBullets[ebi];
+        seenEBullets[eb.id] = true;
+        if (!_eBulletTrailCache[eb.id]) _eBulletTrailCache[eb.id] = [];
+        var etc = _eBulletTrailCache[eb.id];
+        etc.push({x: eb.x, y: eb.y});
+        if (etc.length > 6) etc.shift();
+        eb.trail = etc;
+    }
+    for (var ebk in _eBulletTrailCache) { if (!seenEBullets[ebk]) delete _eBulletTrailCache[ebk]; }
 }
 
 function diffAndTriggerEffects(prev, curr) {
@@ -5852,22 +6020,288 @@ function diffAndTriggerEffects(prev, curr) {
 }
 
 function guestLoop(timestamp) {
-    if (role !== 'guest') return;
+    if (role !== 'guest') { _guestLoopRunning = false; return; }
+    // Merge starfield/plasma rendering into same rAF frame
+    _externalRaf = true;
+    if (window._sfDraw) window._sfDraw(timestamp);
     updateWASD();
 
-    // Send input to server
-    wsEmit('input', { mouseX: sharedMouseX, mouseY: sharedMouseY, mouseDown: sharedMouseDown });
+    // Send input to server (throttled to ~20Hz)
+    var _now = performance.now();
+    if (_now - _lastInputSend >= 50) {
+        wsEmit('input', { mouseX: sharedMouseX, mouseY: sharedMouseY, mouseDown: sharedMouseDown });
+        _lastInputSend = _now;
+    }
 
-    if (remoteState) {
-        // Diff and trigger local effects before applying new state
+    var newStateApplied = false;
+
+    if (_interpBuffer.length >= 2) {
+        // Render at (now - delay) to allow interpolation between buffered snapshots
+        var renderTime = performance.now() - _interpDelay;
+
+        // Find the two snapshots that straddle renderTime
+        var a = null, b = null;
+        for (var si = 0; si < _interpBuffer.length - 1; si++) {
+            if (_interpBuffer[si].time <= renderTime && _interpBuffer[si + 1].time >= renderTime) {
+                a = _interpBuffer[si];
+                b = _interpBuffer[si + 1];
+                break;
+            }
+        }
+
+        if (a && b) {
+            var hostSpan = b.hostTime - a.hostTime; // actual simulation interval
+            var arrivalSpan = b.time - a.time;      // arrival interval (jittery)
+            var span = hostSpan > 0 ? hostSpan : arrivalSpan; // prefer host timing
+            var elapsed = renderTime - a.time; // arrival-anchored render time
+            var t = span > 0 ? elapsed / span : 1;
+            var interpState = interpolateStates(a.state, b.state, t);
+
+            // Diff for effects using the latest fully-reached snapshot
+            if (_interpLastApplied !== b.state) {
+                if (_interpLastApplied) {
+                    diffAndTriggerEffects(_interpLastApplied, b.state);
+                }
+                _interpLastApplied = b.state;
+            }
+
+            applyRemoteState(interpState);
+            _lastGuestState = interpState;
+            newStateApplied = true;
+        } else if (renderTime > _interpBuffer[_interpBuffer.length - 1].time) {
+            // Past the buffer — use latest state directly (slight extrapolation gap)
+            var latest = _interpBuffer[_interpBuffer.length - 1].state;
+            if (_interpLastApplied !== latest) {
+                if (_interpLastApplied) {
+                    diffAndTriggerEffects(_interpLastApplied, latest);
+                }
+                _interpLastApplied = latest;
+            }
+            applyRemoteState(latest);
+            _lastGuestState = latest;
+            newStateApplied = true;
+        }
+    } else if (remoteState) {
+        // Not enough buffer yet — apply directly (first moments of connection)
         if (prevRemoteState) {
             diffAndTriggerEffects(prevRemoteState, remoteState);
         }
         prevRemoteState = remoteState;
-
-        // Apply remote state to local gameState for rendering
         applyRemoteState(remoteState);
+        _lastGuestState = remoteState;
+        newStateApplied = true;
+    }
 
+    // Fallback: no interpolation path produced a state this frame, but we have
+    // a previous state — re-apply it so the guest never skips a render frame.
+    if (!newStateApplied && _lastGuestState) {
+        applyRemoteState(_lastGuestState);
+    }
+
+    // --- Client-side prediction for local guest player ---
+    if (_lastGuestState && myPlayerId) {
+        // Find the server version of our local player
+        var serverPlayer = null;
+        var serverPlayerIdx = -1;
+        for (var spi = 0; spi < gameState.players.length; spi++) {
+            if (gameState.players[spi].playerId === myPlayerId) {
+                serverPlayer = gameState.players[spi];
+                serverPlayerIdx = spi;
+                break;
+            }
+        }
+        if (serverPlayer) {
+            // Initialize predicted player from server state on first frame or after reset
+            if (!_predictedPlayer) {
+                _predictedPlayer = {};
+                for (var sk in serverPlayer) {
+                    if (serverPlayer.hasOwnProperty(sk)) _predictedPlayer[sk] = serverPlayer[sk];
+                }
+                _predictedPlayer.prevX = serverPlayer.x;
+                _predictedPlayer.prevY = serverPlayer.y;
+                _predictedPlayer._drifting = false;
+                _predictedPlayer._driftVx = 0;
+                _predictedPlayer._driftVy = 0;
+            }
+
+            // Save previous position for drift velocity calculation
+            _predictedPlayer.prevX = _predictedPlayer.x;
+            _predictedPlayer.prevY = _predictedPlayer.y;
+
+            // Copy all non-position fields from server (shields, alive, level, etc.)
+            _predictedPlayer.shields = serverPlayer.shields;
+            _predictedPlayer.maxShields = serverPlayer.maxShields;
+            _predictedPlayer.alive = serverPlayer.alive;
+            _predictedPlayer.level = serverPlayer.level;
+            _predictedPlayer.xp = serverPlayer.xp;
+            _predictedPlayer.xpToNext = serverPlayer.xpToNext;
+            _predictedPlayer.combo = serverPlayer.combo;
+            _predictedPlayer.comboTimer = serverPlayer.comboTimer;
+            _predictedPlayer.comboMax = serverPlayer.comboMax;
+            _predictedPlayer.bestCombo = serverPlayer.bestCombo;
+            _predictedPlayer.killCount = serverPlayer.killCount;
+            _predictedPlayer.invulnerable = serverPlayer.invulnerable;
+            _predictedPlayer.invulnerableTimer = serverPlayer.invulnerableTimer;
+            _predictedPlayer.blinkTimer = serverPlayer.blinkTimer;
+            _predictedPlayer.respawning = serverPlayer.respawning;
+            _predictedPlayer.respawnTimer = serverPlayer.respawnTimer;
+            _predictedPlayer.warpPhase = serverPlayer.warpPhase;
+            _predictedPlayer.opacity = serverPlayer.opacity;
+            _predictedPlayer.scale = serverPlayer.scale;
+            _predictedPlayer.fireTimer = serverPlayer.fireTimer;
+            _predictedPlayer.fireRate = serverPlayer.fireRate;
+            _predictedPlayer.overdriveTimer = serverPlayer.overdriveTimer;
+            _predictedPlayer.overdriveActive = serverPlayer.overdriveActive;
+            _predictedPlayer.overdriveDuration = serverPlayer.overdriveDuration;
+            _predictedPlayer.voidDriftCooldown = serverPlayer.voidDriftCooldown;
+            _predictedPlayer.voidDrifting = serverPlayer.voidDrifting;
+            _predictedPlayer.wingmen = serverPlayer.wingmen;
+            _predictedPlayer.color = serverPlayer.color;
+            _predictedPlayer.label = serverPlayer.label;
+            _predictedPlayer.colorIndex = serverPlayer.colorIndex;
+            _predictedPlayer.playerId = serverPlayer.playerId;
+            _predictedPlayer.id = serverPlayer.id;
+            _predictedPlayer.radius = serverPlayer.radius;
+            _predictedPlayer.baseShields = serverPlayer.baseShields;
+            _predictedPlayer.shotIndex = serverPlayer.shotIndex;
+            _predictedPlayer.shieldAngle = serverPlayer.shieldAngle;
+            _predictedPlayer.shieldRechargeTimer = serverPlayer.shieldRechargeTimer;
+            _predictedPlayer.shieldRechargeRate = serverPlayer.shieldRechargeRate;
+            _predictedPlayer.deathTime = serverPlayer.deathTime;
+            _predictedPlayer.lastValidAngle = serverPlayer.lastValidAngle;
+            _predictedPlayer.screenFlashAlpha = serverPlayer.screenFlashAlpha;
+
+            // Snap to server on death, respawn, or invulnerability
+            if (!serverPlayer.alive || serverPlayer.respawning || serverPlayer.invulnerable) {
+                _predictedPlayer.x = serverPlayer.x;
+                _predictedPlayer.y = serverPlayer.y;
+                _predictedPlayer.angle = serverPlayer.angle;
+                _predictedPlayer.targetAngle = serverPlayer.targetAngle;
+                _predictedPlayer.drifting = serverPlayer.drifting;
+                _predictedPlayer.driftVx = serverPlayer.driftVx;
+                _predictedPlayer.driftVy = serverPlayer.driftVy;
+                _predictedPlayer.driftSteer = serverPlayer.driftSteer;
+                _predictedPlayer.glideVx = serverPlayer.glideVx;
+                _predictedPlayer.glideVy = serverPlayer.glideVy;
+                _predictedPlayer._drifting = false;
+                _predictedPlayer._driftVx = 0;
+                _predictedPlayer._driftVy = 0;
+            } else {
+                // Apply local input to predicted player (mirrors host movement logic)
+                var lerpRates = [0.012, 0.011, 0.011, 0.010, 0.010, 0.009, 0.009, 0.008, 0.008, 0.008];
+                var lr = lerpRates[(serverPlayer.level || 1) - 1] || 0.008;
+
+                // --- Drift mechanic ---
+                if (sharedMouseDown) {
+                    if (!_predictedPlayer._drifting) {
+                        // Entering drift: capture current velocity
+                        var capVx = (sharedMouseX - _predictedPlayer.x) * lr;
+                        var capVy = (sharedMouseY - _predictedPlayer.y) * lr;
+                        var capSpd = Math.sqrt(capVx * capVx + capVy * capVy);
+                        var capDist = Math.sqrt(Math.pow(sharedMouseX - _predictedPlayer.x, 2) + Math.pow(sharedMouseY - _predictedPlayer.y, 2));
+                        var capMin = 1.8;
+                        if (capDist > 2 && capSpd > 0.001 && capSpd < capMin) {
+                            var capBoost = capMin / capSpd;
+                            capVx *= capBoost;
+                            capVy *= capBoost;
+                            capSpd = capMin;
+                        }
+                        if (capSpd > 0.5) {
+                            _predictedPlayer._drifting = true;
+                            _predictedPlayer._driftVx = capVx;
+                            _predictedPlayer._driftVy = capVy;
+                        }
+                    }
+                } else if (_predictedPlayer._drifting) {
+                    _predictedPlayer._drifting = false;
+                    _predictedPlayer._driftVx = 0;
+                    _predictedPlayer._driftVy = 0;
+                }
+
+                if (_predictedPlayer._drifting) {
+                    // Drift steering toward mouse (rear-wheel drift feel)
+                    var aimAngle = Math.atan2(sharedMouseY - _predictedPlayer.y, sharedMouseX - _predictedPlayer.x);
+                    var driftAngle = Math.atan2(_predictedPlayer._driftVy, _predictedPlayer._driftVx);
+                    var steerDiff = aimAngle - driftAngle;
+                    // Normalize to [-PI, PI]
+                    while (steerDiff > Math.PI) steerDiff -= 2 * Math.PI;
+                    while (steerDiff < -Math.PI) steerDiff += 2 * Math.PI;
+                    var steerStrength = 0.03;
+
+                    var driftSpeed = Math.sqrt(_predictedPlayer._driftVx * _predictedPlayer._driftVx + _predictedPlayer._driftVy * _predictedPlayer._driftVy);
+                    var newDriftAngle = driftAngle + steerDiff * steerStrength;
+                    _predictedPlayer._driftVx = Math.cos(newDriftAngle) * driftSpeed;
+                    _predictedPlayer._driftVy = Math.sin(newDriftAngle) * driftSpeed;
+
+                    _predictedPlayer._driftVx *= 0.998;
+                    _predictedPlayer._driftVy *= 0.998;
+
+                    _predictedPlayer.x += _predictedPlayer._driftVx;
+                    _predictedPlayer.y += _predictedPlayer._driftVy;
+
+                    _predictedPlayer.drifting = true;
+                    _predictedPlayer.driftVx = _predictedPlayer._driftVx;
+                    _predictedPlayer.driftVy = _predictedPlayer._driftVy;
+                    _predictedPlayer.glideVx = _predictedPlayer._driftVx;
+                    _predictedPlayer.glideVy = _predictedPlayer._driftVy;
+                } else {
+                    // Normal movement: lerp toward mouse
+                    var lerpDx = (sharedMouseX - _predictedPlayer.x) * lr;
+                    var lerpDy = (sharedMouseY - _predictedPlayer.y) * lr;
+                    var lerpSpd = Math.sqrt(lerpDx * lerpDx + lerpDy * lerpDy);
+                    var distToMouse = Math.sqrt(Math.pow(sharedMouseX - _predictedPlayer.x, 2) + Math.pow(sharedMouseY - _predictedPlayer.y, 2));
+                    var minSpd = 1.8;
+                    if (distToMouse > 2 && lerpSpd > 0.001 && lerpSpd < minSpd) {
+                        var boost = minSpd / lerpSpd;
+                        lerpDx *= boost;
+                        lerpDy *= boost;
+                    }
+                    _predictedPlayer.x += lerpDx;
+                    _predictedPlayer.y += lerpDy;
+                    _predictedPlayer.glideVx = lerpDx;
+                    _predictedPlayer.glideVy = lerpDy;
+                    _predictedPlayer.drifting = false;
+                    _predictedPlayer.driftVx = 0;
+                    _predictedPlayer.driftVy = 0;
+                }
+
+                // Clamp to world boundaries
+                var margin = _predictedPlayer.radius || 10;
+                _predictedPlayer.x = clamp(_predictedPlayer.x, margin, WORLD_W - margin);
+                _predictedPlayer.y = clamp(_predictedPlayer.y, margin, WORLD_H - margin);
+
+                // Bounce off walls during drift
+                if (_predictedPlayer._drifting) {
+                    if (_predictedPlayer.x <= margin || _predictedPlayer.x >= WORLD_W - margin) _predictedPlayer._driftVx *= -0.3;
+                    if (_predictedPlayer.y <= margin || _predictedPlayer.y >= WORLD_H - margin) _predictedPlayer._driftVy *= -0.3;
+                }
+
+                // Blend predicted position toward server position (reconciliation)
+                _predictedPlayer.x += (serverPlayer.x - _predictedPlayer.x) * _predictionSmoothing;
+                _predictedPlayer.y += (serverPlayer.y - _predictedPlayer.y) * _predictionSmoothing;
+
+                // Angle prediction: aim toward mouse
+                var pdx = sharedMouseX - _predictedPlayer.x;
+                var pdy = sharedMouseY - _predictedPlayer.y;
+                var pSpeed = Math.sqrt(pdx * pdx + pdy * pdy);
+                if (_predictedPlayer._drifting) {
+                    _predictedPlayer.targetAngle = Math.atan2(sharedMouseY - _predictedPlayer.y, sharedMouseX - _predictedPlayer.x);
+                } else if (pSpeed > 0.5) {
+                    _predictedPlayer.targetAngle = Math.atan2(pdy, pdx);
+                }
+                var pAngleDiff = _predictedPlayer.targetAngle - _predictedPlayer.angle;
+                while (pAngleDiff > Math.PI) pAngleDiff -= 2 * Math.PI;
+                while (pAngleDiff < -Math.PI) pAngleDiff += 2 * Math.PI;
+                _predictedPlayer.angle += pAngleDiff * 0.12;
+            }
+
+            // Overwrite the local player in gameState with predicted state for rendering
+            gameState.players[serverPlayerIdx] = _predictedPlayer;
+        }
+    }
+
+    // Render unconditionally once we have received at least one state
+    if (_lastGuestState) {
         // Run particle/ring/effect updates locally
         // NOTE: Do NOT call updateExplosionZones — host sends authoritative zones.
         // Running it locally corrupts zones (missing maxRadius/fadeDuration → NaN → kills plasma shader).
@@ -5899,7 +6333,10 @@ function guestLoop(timestamp) {
 
 // === SECTION: Master Game Loop ===
 function masterLoop(timestamp) {
-    if (role !== 'host') return;
+    if (role !== 'host') { _masterLoopRunning = false; return; }
+    // Merge starfield/plasma rendering into same rAF frame
+    _externalRaf = true;
+    if (window._sfDraw) window._sfDraw(timestamp);
     updateWASD();
 
     var explosionZones = updateGame(timestamp, sharedMouseX, sharedMouseY, sharedMouseDown);
@@ -5917,8 +6354,12 @@ function masterLoop(timestamp) {
         window.parent.postMessage(msg, '*');
     }
 
-    // Broadcast state to guests
-    wsEmit('state', serializeState());
+    // Broadcast state to guests (throttled to ~20Hz)
+    var now = performance.now();
+    if (now - _lastStateSend >= 50) {
+        wsEmit('state', serializeState());
+        _lastStateSend = now;
+    }
 
     // Plasma rendering is handled in the starfield loop (same RAF = guaranteed order)
 
@@ -5940,20 +6381,28 @@ wsOn('role', function(data) {
         gameState.players[0].colorIndex = myColorIndex;
         gameState.players[0].playerId = myPlayerId;
         gameState.players[0].isLocal = true;
-        requestAnimationFrame(masterLoop);
+        if (!_masterLoopRunning) {
+            _masterLoopRunning = true;
+            requestAnimationFrame(masterLoop);
+        }
     } else {
         // Guest — canvas setup only, wait for state
         gameCanvas = document.getElementById('game-canvas');
         gameCtx = gameCanvas.getContext('2d');
         canvasW = gameCanvas.width = WORLD_W;
         canvasH = gameCanvas.height = WORLD_H;
-        requestAnimationFrame(guestLoop);
+        if (!_guestLoopRunning) {
+            _guestLoopRunning = true;
+            requestAnimationFrame(guestLoop);
+        }
     }
 });
 
 wsOn('current-state', function(data) {
     if (role === 'guest') {
         remoteState = data;
+        _interpBuffer.push({ state: data, time: performance.now(), hostTime: data.hostTime || 0 });
+        if (_interpBuffer.length > 6) _interpBuffer.shift();
     }
 });
 
@@ -5990,6 +6439,8 @@ wsOn('player-left', function(data) {
 wsOn('state', function(data) {
     if (role === 'guest') {
         remoteState = data;
+        _interpBuffer.push({ state: data, time: performance.now(), hostTime: data.hostTime || 0 });
+        if (_interpBuffer.length > 6) _interpBuffer.shift();
     }
 });
 
@@ -6023,7 +6474,10 @@ wsOn('promote-to-host', function(data) {
             gameState.players[i].isLocal = false;
         }
     }
-    requestAnimationFrame(masterLoop);
+    if (!_masterLoopRunning) {
+        _masterLoopRunning = true;
+        requestAnimationFrame(masterLoop);
+    }
 });
 
 // === SECTION: Initialization ===

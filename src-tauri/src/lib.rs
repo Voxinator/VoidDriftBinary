@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::Manager;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
@@ -26,7 +26,7 @@ struct ClientInfo {
 struct RelayState {
     clients: HashMap<String, ClientInfo>,
     host_id: Option<String>,
-    last_game_state: Option<serde_json::Value>,
+    last_game_state: Option<String>,
     next_color_index: u32,
     join_counter: u32,
 }
@@ -37,6 +37,7 @@ type SharedState = Arc<Mutex<RelayState>>;
 struct AppState {
     relay: SharedState,
     index_html: PathBuf,
+    state_watch: watch::Sender<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -86,19 +87,19 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state.relay))
+    ws.on_upgrade(move |socket| handle_socket(socket, state.relay, state.state_watch))
 }
 
 // --- WebSocket Connection Handler ---
 
-async fn handle_socket(socket: WebSocket, relay: SharedState) {
+async fn handle_socket(socket: WebSocket, relay: SharedState, state_watch: watch::Sender<Option<String>>) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Create a channel for sending messages to this client
+    // Create a channel for sending control messages to this client
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    // Assign an ID to this connection
-    let player_id = {
+    // Assign an ID to this connection and determine role
+    let (player_id, is_host) = {
         let mut state = relay.lock().await;
         let id = format!("conn_{}", state.join_counter);
         let color_index = state.next_color_index % 4;
@@ -116,7 +117,7 @@ async fn handle_socket(socket: WebSocket, relay: SharedState) {
         );
 
         // Determine role
-        if state.host_id.is_none() {
+        let host = if state.host_id.is_none() {
             state.host_id = Some(id.clone());
             let role_msg = WsOutMessage {
                 msg_type: "role".to_string(),
@@ -127,6 +128,7 @@ async fn handle_socket(socket: WebSocket, relay: SharedState) {
                 }),
             };
             let _ = tx.send(role_msg.to_json());
+            true
         } else {
             let role_msg = WsOutMessage {
                 msg_type: "role".to_string(),
@@ -138,13 +140,9 @@ async fn handle_socket(socket: WebSocket, relay: SharedState) {
             };
             let _ = tx.send(role_msg.to_json());
 
-            // Send cached game state if available
+            // Send cached game state if available (raw "state" message — guest handles it the same as "current-state")
             if let Some(ref game_state) = state.last_game_state {
-                let state_msg = WsOutMessage {
-                    msg_type: "current-state".to_string(),
-                    data: game_state.clone(),
-                };
-                let _ = tx.send(state_msg.to_json());
+                let _ = tx.send(game_state.clone());
             }
 
             // Notify host about the new player
@@ -160,16 +158,57 @@ async fn handle_socket(socket: WebSocket, relay: SharedState) {
                     let _ = host.sender.send(join_msg.to_json());
                 }
             }
-        }
+            false
+        };
 
-        id
+        (id, host)
     };
 
-    // Spawn a task to forward channel messages to the WebSocket
+    // Subscribe to the watch channel for game state broadcasts (guests only —
+    // the host generates state and doesn't need to read it back)
+    let mut state_rx = if is_host {
+        None
+    } else {
+        Some(state_watch.subscribe())
+    };
+
+    // Spawn a task to forward control messages and game state to the WebSocket
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if ws_sender.send(Message::Text(msg.into())).await.is_err() {
-                break;
+        loop {
+            if let Some(ref mut watch_rx) = state_rx {
+                // Guest path: prioritize state delivery over control messages
+                tokio::select! {
+                    biased;
+                    result = watch_rx.changed() => {
+                        if result.is_err() { break; }
+                        let val = watch_rx.borrow_and_update().clone();
+                        if let Some(json) = val {
+                            if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(m) => {
+                                if ws_sender.send(Message::Text(m.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            } else {
+                // Host path: no watch subscription, only control messages
+                match rx.recv().await {
+                    Some(m) => {
+                        if ws_sender.send(Message::Text(m.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
             }
         }
     });
@@ -180,7 +219,7 @@ async fn handle_socket(socket: WebSocket, relay: SharedState) {
             Message::Text(text) => {
                 let text_str: &str = &text;
                 if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(text_str) {
-                    handle_message(&relay, &player_id, ws_msg).await;
+                    handle_message(&relay, &player_id, ws_msg, text_str, &state_watch).await;
                 }
             }
             Message::Close(_) => break,
@@ -195,7 +234,7 @@ async fn handle_socket(socket: WebSocket, relay: SharedState) {
     send_task.abort();
 }
 
-async fn handle_message(relay: &SharedState, sender_id: &str, msg: WsMessage) {
+async fn handle_message(relay: &SharedState, sender_id: &str, msg: WsMessage, raw_text: &str, state_watch: &watch::Sender<Option<String>>) {
     let mut state = relay.lock().await;
 
     match msg.msg_type.as_str() {
@@ -221,22 +260,12 @@ async fn handle_message(relay: &SharedState, sender_id: &str, msg: WsMessage) {
             }
         }
         "state" => {
-            // Host sends state -> cache and broadcast to all guests
+            // Host sends state -> cache raw text and forward directly (no re-serialization)
             if state.host_id.as_deref() == Some(sender_id) {
-                let data = msg.data.unwrap_or(serde_json::Value::Null);
-                state.last_game_state = Some(data.clone());
-
-                let out_json = WsOutMessage {
-                    msg_type: "state".to_string(),
-                    data,
-                }
-                .to_json();
-
-                for (id, client) in &state.clients {
-                    if id != sender_id {
-                        let _ = client.sender.send(out_json.clone());
-                    }
-                }
+                state.last_game_state = Some(raw_text.to_string());
+                drop(state);
+                let _ = state_watch.send(Some(raw_text.to_string()));
+                return;
             }
         }
         _ => {}
@@ -265,10 +294,15 @@ async fn handle_disconnect(relay: &SharedState, disconnected_id: &str) {
 
             // Send promote-to-host to the new host
             if let Some(new_host_client) = state.clients.get(new_host_id) {
+                // last_game_state is the raw '{"type":"state","data":{...}}' message.
+                // Extract just the inner "data" field for the promote payload.
+                let cached_state = state.last_game_state.as_deref()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .and_then(|v| v.get("data").cloned());
                 let promote_msg = WsOutMessage {
                     msg_type: "promote-to-host".to_string(),
                     data: serde_json::json!({
-                        "state": state.last_game_state
+                        "state": cached_state
                     }),
                 };
                 let _ = new_host_client.sender.send(promote_msg.to_json());
@@ -316,9 +350,12 @@ async fn start_relay_server(sounds_dir: PathBuf, index_html: PathBuf) {
         join_counter: 0,
     }));
 
+    let (state_watch, _) = watch::channel::<Option<String>>(None);
+
     let app_state = AppState {
         relay,
         index_html,
+        state_watch,
     };
 
     let app = Router::new()
