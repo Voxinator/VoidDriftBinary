@@ -224,7 +224,7 @@
 
 <script>
 var EMBED_MODE = false;
-var GAME_VERSION = '0.4.0';
+var GAME_VERSION = '0.5.0';
 var XP_THRESHOLDS = [30, 50, 80, 110, 150, 200, 260, 330, 420];
 var LEVEL_NAMES = ['Scout','Gunner','Ace','Vanguard','Striker','Predator','Warden','Tempest','Sovereign','Void Walker'];
 var _levelUpText = '';
@@ -568,6 +568,1135 @@ function updatePlasma(time, mouseNX, mouseNY, explosions, shipAlpha) {
   gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT);
   gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+// === SECTION: WebGL Fluid Nebula ===
+// GPU Stable-Fluids nebula (Stam/Dobryakov technique, adapted from the
+// boreal-fresco demo). Replaces the plasma background when float-texture
+// rendering is available; initPlasma() remains the automatic fallback (see
+// startAll). Owns a dedicated offscreen canvas + WebGL context — no GL state
+// is shared with _plasma. Game coupling feeds splats in via _fluid.splat() /
+// _fluid.burst(); everything else stays inside this IIFE so no demo-named
+// globals (splat/step/render/config/canvas/gl/blit) leak out.
+
+window._fluid = (function() {
+  var fluid = {
+    ready: false,        // true only after successful init
+    canvas: null,        // offscreen canvas, WORLD_W*0.5 x WORLD_H*0.5
+    init: fluidInit,     // returns true/false; never throws outward
+    update: fluidUpdate, // ambient splats (if cfg.AMBIENT) + queued splats + sim step
+    render: fluidRender, // bloom + display pass to its own canvas
+    splat: fluidSplat,
+    burst: fluidBurst,
+    hexToRgbF: fluidHexToRgbF,  // PUBLIC — coupling code calls this from outside the IIFE
+    _splatCount: 0,      // attribution counter: incremented on EVERY applied splat
+    _burstCount: 0,      // incremented once per burst() call
+    cfg: {
+      SIM_RESOLUTION: 128,
+      DYE_RESOLUTION: 512,
+      DENSITY_DISSIPATION: 0.32,
+      VELOCITY_DISSIPATION: 0.22,
+      PRESSURE: 0.8,
+      PRESSURE_ITERATIONS: 14,
+      CURL: 5,
+      TIME_SCALE: 0.35,
+      SPLAT_RADIUS: 0.25,
+      FORCE: 6000,
+      BLOOM: true,
+      BLOOM_RESOLUTION: 128,
+      BLOOM_ITERATIONS: 8,
+      BLOOM_INTENSITY: 0.7,
+      BLOOM_THRESHOLD: 0.55,
+      BLOOM_SOFT_KNEE: 0.7,
+      SHADING: true,
+      AMBIENT: true
+    }
+  };
+  var cfg = fluid.cfg;
+
+  // -- Module state (populated in fluidInit; inert until then) --
+  var fgl = null;              // dedicated WebGL context
+  var fCanvas = null;
+  var fIsWebGL2 = false;
+  var fHalfFloatType = null;
+  var fLinearFiltering = false;
+  var fFormatRGBA = null, fFormatRG = null, fFormatR = null;
+  var fMaxTextureSize = 0;
+  var fDye = null, fVelocity = null, fDivergence = null, fCurl = null, fPressure = null;
+  var fBloom = null;
+  var fBloomFBOs = [];
+  var fPrograms = null;
+  var fPending = [];           // queued splats, flushed each update under the frame budget
+  var FLUID_SPLAT_BUDGET = 24; // max splats applied per frame (bursts jump the queue)
+  var fAmbientTimer = 0;
+  var fAmbientInterval = 4 + Math.random() * 3;
+  var fHueDrift = Math.random();
+
+  // -- Shaders --
+  var FLUID_VERT = `
+    precision highp float;
+    attribute vec2 aPosition;
+    varying vec2 vUv;
+    varying vec2 vL;
+    varying vec2 vR;
+    varying vec2 vT;
+    varying vec2 vB;
+    uniform vec2 texelSize;
+    void main () {
+      vUv = aPosition * 0.5 + 0.5;
+      vL = vUv - vec2(texelSize.x, 0.0);
+      vR = vUv + vec2(texelSize.x, 0.0);
+      vT = vUv + vec2(0.0, texelSize.y);
+      vB = vUv - vec2(0.0, texelSize.y);
+      gl_Position = vec4(aPosition, 0.0, 1.0);
+    }
+  `;
+
+  var FLUID_CLEAR_FRAG = `
+    precision mediump float;
+    precision mediump sampler2D;
+    varying highp vec2 vUv;
+    uniform sampler2D uTexture;
+    uniform float value;
+    void main () {
+      gl_FragColor = value * texture2D(uTexture, vUv);
+    }
+  `;
+
+  var FLUID_SPLAT_FRAG = `
+    precision highp float;
+    precision highp sampler2D;
+    varying vec2 vUv;
+    uniform sampler2D uTarget;
+    uniform float aspectRatio;
+    uniform vec3 color;
+    uniform vec2 point;
+    uniform float radius;
+    void main () {
+      vec2 p = vUv - point.xy;
+      p.x *= aspectRatio;
+      vec3 s = exp(-dot(p, p) / radius) * color;
+      vec3 base = texture2D(uTarget, vUv).xyz;
+      gl_FragColor = vec4(base + s, 1.0);
+    }
+  `;
+
+  var FLUID_ADVECTION_FRAG = `
+    precision highp float;
+    precision highp sampler2D;
+    varying vec2 vUv;
+    uniform sampler2D uVelocity;
+    uniform sampler2D uSource;
+    uniform vec2 texelSize;
+    uniform vec2 dyeTexelSize;
+    uniform float dt;
+    uniform float dissipation;
+
+    vec4 bilerp (sampler2D sam, vec2 uv, vec2 tsize) {
+      vec2 st = uv / tsize - 0.5;
+      vec2 iuv = floor(st);
+      vec2 fuv = fract(st);
+      vec4 a = texture2D(sam, (iuv + vec2(0.5, 0.5)) * tsize);
+      vec4 b = texture2D(sam, (iuv + vec2(1.5, 0.5)) * tsize);
+      vec4 c = texture2D(sam, (iuv + vec2(0.5, 1.5)) * tsize);
+      vec4 d = texture2D(sam, (iuv + vec2(1.5, 1.5)) * tsize);
+      return mix(mix(a, b, fuv.x), mix(c, d, fuv.x), fuv.y);
+    }
+
+    void main () {
+    #ifdef MANUAL_FILTERING
+      vec2 coord = vUv - dt * bilerp(uVelocity, vUv, texelSize).xy * texelSize;
+      vec4 result = bilerp(uSource, coord, dyeTexelSize);
+    #else
+      vec2 coord = vUv - dt * texture2D(uVelocity, vUv).xy * texelSize;
+      vec4 result = texture2D(uSource, coord);
+    #endif
+      float decay = 1.0 + dissipation * dt;
+      gl_FragColor = result / decay;
+    }
+  `;
+
+  var FLUID_DIVERGENCE_FRAG = `
+    precision mediump float;
+    precision mediump sampler2D;
+    varying highp vec2 vUv;
+    varying highp vec2 vL;
+    varying highp vec2 vR;
+    varying highp vec2 vT;
+    varying highp vec2 vB;
+    uniform sampler2D uVelocity;
+    void main () {
+      float L = texture2D(uVelocity, vL).x;
+      float R = texture2D(uVelocity, vR).x;
+      float T = texture2D(uVelocity, vT).y;
+      float B = texture2D(uVelocity, vB).y;
+      vec2 C = texture2D(uVelocity, vUv).xy;
+      if (vL.x < 0.0) { L = -C.x; }
+      if (vR.x > 1.0) { R = -C.x; }
+      if (vT.y > 1.0) { T = -C.y; }
+      if (vB.y < 0.0) { B = -C.y; }
+      float div = 0.5 * (R - L + T - B);
+      gl_FragColor = vec4(div, 0.0, 0.0, 1.0);
+    }
+  `;
+
+  var FLUID_CURL_FRAG = `
+    precision mediump float;
+    precision mediump sampler2D;
+    varying highp vec2 vUv;
+    varying highp vec2 vL;
+    varying highp vec2 vR;
+    varying highp vec2 vT;
+    varying highp vec2 vB;
+    uniform sampler2D uVelocity;
+    void main () {
+      float L = texture2D(uVelocity, vL).y;
+      float R = texture2D(uVelocity, vR).y;
+      float T = texture2D(uVelocity, vT).x;
+      float B = texture2D(uVelocity, vB).x;
+      float vorticity = R - L - T + B;
+      gl_FragColor = vec4(0.5 * vorticity, 0.0, 0.0, 1.0);
+    }
+  `;
+
+  var FLUID_VORTICITY_FRAG = `
+    precision highp float;
+    precision highp sampler2D;
+    varying vec2 vUv;
+    varying vec2 vL;
+    varying vec2 vR;
+    varying vec2 vT;
+    varying vec2 vB;
+    uniform sampler2D uVelocity;
+    uniform sampler2D uCurl;
+    uniform float curl;
+    uniform float dt;
+    void main () {
+      float L = texture2D(uCurl, vL).x;
+      float R = texture2D(uCurl, vR).x;
+      float T = texture2D(uCurl, vT).x;
+      float B = texture2D(uCurl, vB).x;
+      float C = texture2D(uCurl, vUv).x;
+      vec2 force = 0.5 * vec2(abs(T) - abs(B), abs(L) - abs(R));
+      force /= length(force) + 0.0001;
+      force *= curl * C;
+      vec2 velocity = texture2D(uVelocity, vUv).xy;
+      velocity += force * dt;
+      velocity = min(max(velocity, -1000.0), 1000.0);
+      gl_FragColor = vec4(velocity, 0.0, 1.0);
+    }
+  `;
+
+  var FLUID_PRESSURE_FRAG = `
+    precision mediump float;
+    precision mediump sampler2D;
+    varying highp vec2 vUv;
+    varying highp vec2 vL;
+    varying highp vec2 vR;
+    varying highp vec2 vT;
+    varying highp vec2 vB;
+    uniform sampler2D uPressure;
+    uniform sampler2D uDivergence;
+    void main () {
+      float L = texture2D(uPressure, vL).x;
+      float R = texture2D(uPressure, vR).x;
+      float T = texture2D(uPressure, vT).x;
+      float B = texture2D(uPressure, vB).x;
+      float divergence = texture2D(uDivergence, vUv).x;
+      float pressure = (L + R + B + T - divergence) * 0.25;
+      gl_FragColor = vec4(pressure, 0.0, 0.0, 1.0);
+    }
+  `;
+
+  var FLUID_GRADSUB_FRAG = `
+    precision mediump float;
+    precision mediump sampler2D;
+    varying highp vec2 vUv;
+    varying highp vec2 vL;
+    varying highp vec2 vR;
+    varying highp vec2 vT;
+    varying highp vec2 vB;
+    uniform sampler2D uPressure;
+    uniform sampler2D uVelocity;
+    void main () {
+      float L = texture2D(uPressure, vL).x;
+      float R = texture2D(uPressure, vR).x;
+      float T = texture2D(uPressure, vT).x;
+      float B = texture2D(uPressure, vB).x;
+      vec2 velocity = texture2D(uVelocity, vUv).xy;
+      velocity.xy -= vec2(R - L, T - B);
+      gl_FragColor = vec4(velocity, 0.0, 1.0);
+    }
+  `;
+
+  var FLUID_BLOOM_PREFILTER_FRAG = `
+    precision mediump float;
+    precision mediump sampler2D;
+    varying highp vec2 vUv;
+    uniform sampler2D uTexture;
+    uniform vec3 curve;
+    uniform float threshold;
+    void main () {
+      vec3 c = texture2D(uTexture, vUv).rgb;
+      float br = max(c.r, max(c.g, c.b));
+      float rq = clamp(br - curve.x, 0.0, curve.y);
+      rq = curve.z * rq * rq;
+      c *= max(rq, br - threshold) / max(br, 0.0001);
+      gl_FragColor = vec4(c, 0.0);
+    }
+  `;
+
+  var FLUID_BLOOM_BLUR_FRAG = `
+    precision mediump float;
+    precision mediump sampler2D;
+    varying highp vec2 vL;
+    varying highp vec2 vR;
+    varying highp vec2 vT;
+    varying highp vec2 vB;
+    uniform sampler2D uTexture;
+    void main () {
+      vec4 sum = vec4(0.0);
+      sum += texture2D(uTexture, vL);
+      sum += texture2D(uTexture, vR);
+      sum += texture2D(uTexture, vT);
+      sum += texture2D(uTexture, vB);
+      gl_FragColor = sum * 0.25;
+    }
+  `;
+
+  var FLUID_BLOOM_FINAL_FRAG = `
+    precision mediump float;
+    precision mediump sampler2D;
+    varying highp vec2 vL;
+    varying highp vec2 vR;
+    varying highp vec2 vT;
+    varying highp vec2 vB;
+    uniform sampler2D uTexture;
+    uniform float intensity;
+    void main () {
+      vec4 sum = vec4(0.0);
+      sum += texture2D(uTexture, vL);
+      sum += texture2D(uTexture, vR);
+      sum += texture2D(uTexture, vT);
+      sum += texture2D(uTexture, vB);
+      gl_FragColor = sum * 0.25 * intensity;
+    }
+  `;
+
+  // Dye display only (no velocity/pressure/curl debug modes); alpha = max
+  // channel so the output is premultiplied-compatible for ctx.drawImage
+  // compositing over the starfield canvas.
+  var FLUID_DISPLAY_FRAG = `
+    precision highp float;
+    precision highp sampler2D;
+    varying vec2 vUv;
+    varying vec2 vL;
+    varying vec2 vR;
+    varying vec2 vT;
+    varying vec2 vB;
+    uniform sampler2D uTexture;
+    uniform sampler2D uBloom;
+    uniform vec2 texelSize;
+    uniform bool uShading;
+    uniform bool uBloomEnabled;
+
+    vec3 linearToGamma (vec3 color) {
+      color = max(color, vec3(0.0));
+      return max(1.055 * pow(color, vec3(0.416666667)) - 0.055, vec3(0.0));
+    }
+
+    float dither () {
+      return (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 255.0;
+    }
+
+    void main () {
+      vec3 c = texture2D(uTexture, vUv).rgb;
+      if (uShading) {
+        vec3 lc = texture2D(uTexture, vL).rgb;
+        vec3 rc = texture2D(uTexture, vR).rgb;
+        vec3 tc = texture2D(uTexture, vT).rgb;
+        vec3 bc = texture2D(uTexture, vB).rgb;
+        float dx = length(rc) - length(lc);
+        float dy = length(tc) - length(bc);
+        vec3 n = normalize(vec3(dx, dy, length(texelSize)));
+        float diffuse = clamp(dot(n, vec3(0.0, 0.0, 1.0)) + 0.7, 0.7, 1.0);
+        c *= diffuse;
+      }
+      if (uBloomEnabled) {
+        vec3 bloom = texture2D(uBloom, vUv).rgb;
+        c += linearToGamma(bloom);
+      }
+      c += dither();
+      float a = max(c.r, max(c.g, c.b));
+      gl_FragColor = vec4(c, a);
+    }
+  `;
+
+  // -- GL helpers --
+
+  function fluidCompileShader(type, source, keywords) {
+    var src = source;
+    if (keywords && keywords.length) {
+      src = keywords.map(function(k) { return '#define ' + k + '\n'; }).join('') + source;
+    }
+    var shader = fgl.createShader(type);
+    fgl.shaderSource(shader, src);
+    fgl.compileShader(shader);
+    if (!fgl.getShaderParameter(shader, fgl.COMPILE_STATUS)) {
+      throw new Error('Fluid shader compile error: ' + fgl.getShaderInfoLog(shader));
+    }
+    return shader;
+  }
+
+  function fluidMakeProgram(vertexShader, fragmentSource, keywords) {
+    var program = fgl.createProgram();
+    var fragmentShader = fluidCompileShader(fgl.FRAGMENT_SHADER, fragmentSource, keywords);
+    fgl.attachShader(program, vertexShader);
+    fgl.attachShader(program, fragmentShader);
+    fgl.bindAttribLocation(program, 0, 'aPosition');
+    fgl.linkProgram(program);
+    if (!fgl.getProgramParameter(program, fgl.LINK_STATUS)) {
+      throw new Error('Fluid program link error: ' + fgl.getProgramInfoLog(program));
+    }
+    var uniforms = {};
+    var count = fgl.getProgramParameter(program, fgl.ACTIVE_UNIFORMS);
+    for (var i = 0; i < count; i++) {
+      var name = fgl.getActiveUniform(program, i).name;
+      uniforms[name] = fgl.getUniformLocation(program, name);
+    }
+    return {
+      uniforms: uniforms,
+      bind: function() { fgl.useProgram(program); }
+    };
+  }
+
+  function fluidBlit(target, clear) {
+    if (target == null) {
+      fgl.viewport(0, 0, fgl.drawingBufferWidth, fgl.drawingBufferHeight);
+      fgl.bindFramebuffer(fgl.FRAMEBUFFER, null);
+    } else {
+      fgl.viewport(0, 0, target.width, target.height);
+      fgl.bindFramebuffer(fgl.FRAMEBUFFER, target.fbo);
+    }
+    if (clear) {
+      fgl.clearColor(0.0, 0.0, 0.0, 1.0);
+      fgl.clear(fgl.COLOR_BUFFER_BIT);
+    }
+    fgl.drawElements(fgl.TRIANGLES, 6, fgl.UNSIGNED_SHORT, 0);
+  }
+
+  function fluidSupportRenderTextureFormat(internalFormat, format, type) {
+    var texture = fgl.createTexture();
+    fgl.bindTexture(fgl.TEXTURE_2D, texture);
+    fgl.texParameteri(fgl.TEXTURE_2D, fgl.TEXTURE_MIN_FILTER, fgl.NEAREST);
+    fgl.texParameteri(fgl.TEXTURE_2D, fgl.TEXTURE_MAG_FILTER, fgl.NEAREST);
+    fgl.texParameteri(fgl.TEXTURE_2D, fgl.TEXTURE_WRAP_S, fgl.CLAMP_TO_EDGE);
+    fgl.texParameteri(fgl.TEXTURE_2D, fgl.TEXTURE_WRAP_T, fgl.CLAMP_TO_EDGE);
+    fgl.texImage2D(fgl.TEXTURE_2D, 0, internalFormat, 4, 4, 0, format, type, null);
+    var fbo = fgl.createFramebuffer();
+    fgl.bindFramebuffer(fgl.FRAMEBUFFER, fbo);
+    fgl.framebufferTexture2D(fgl.FRAMEBUFFER, fgl.COLOR_ATTACHMENT0, fgl.TEXTURE_2D, texture, 0);
+    var ok = fgl.checkFramebufferStatus(fgl.FRAMEBUFFER) === fgl.FRAMEBUFFER_COMPLETE;
+    fgl.bindFramebuffer(fgl.FRAMEBUFFER, null);
+    fgl.deleteFramebuffer(fbo);
+    fgl.deleteTexture(texture);
+    return ok;
+  }
+
+  function fluidGetSupportedFormat(internalFormat, format, type) {
+    if (!fluidSupportRenderTextureFormat(internalFormat, format, type)) {
+      if (fIsWebGL2) {
+        switch (internalFormat) {
+          case fgl.R16F:  return fluidGetSupportedFormat(fgl.RG16F, fgl.RG, type);
+          case fgl.RG16F: return fluidGetSupportedFormat(fgl.RGBA16F, fgl.RGBA, type);
+          default: return null;
+        }
+      }
+      return null;
+    }
+    return { internalFormat: internalFormat, format: format };
+  }
+
+  function fluidCreateFBO(w, h, internalFormat, format, type, filter) {
+    var texture = fgl.createTexture();
+    fgl.activeTexture(fgl.TEXTURE0);
+    fgl.bindTexture(fgl.TEXTURE_2D, texture);
+    fgl.texParameteri(fgl.TEXTURE_2D, fgl.TEXTURE_MIN_FILTER, filter);
+    fgl.texParameteri(fgl.TEXTURE_2D, fgl.TEXTURE_MAG_FILTER, filter);
+    fgl.texParameteri(fgl.TEXTURE_2D, fgl.TEXTURE_WRAP_S, fgl.CLAMP_TO_EDGE);
+    fgl.texParameteri(fgl.TEXTURE_2D, fgl.TEXTURE_WRAP_T, fgl.CLAMP_TO_EDGE);
+    fgl.texImage2D(fgl.TEXTURE_2D, 0, internalFormat, w, h, 0, format, type, null);
+
+    var fbo = fgl.createFramebuffer();
+    fgl.bindFramebuffer(fgl.FRAMEBUFFER, fbo);
+    fgl.framebufferTexture2D(fgl.FRAMEBUFFER, fgl.COLOR_ATTACHMENT0, fgl.TEXTURE_2D, texture, 0);
+    fgl.viewport(0, 0, w, h);
+    fgl.clearColor(0, 0, 0, 1);
+    fgl.clear(fgl.COLOR_BUFFER_BIT);
+
+    return {
+      texture: texture,
+      fbo: fbo,
+      width: w,
+      height: h,
+      texelSizeX: 1.0 / w,
+      texelSizeY: 1.0 / h,
+      attach: function(id) {
+        fgl.activeTexture(fgl.TEXTURE0 + id);
+        fgl.bindTexture(fgl.TEXTURE_2D, texture);
+        return id;
+      }
+    };
+  }
+
+  function fluidCreateDoubleFBO(w, h, internalFormat, format, type, filter) {
+    var fbo1 = fluidCreateFBO(w, h, internalFormat, format, type, filter);
+    var fbo2 = fluidCreateFBO(w, h, internalFormat, format, type, filter);
+    return {
+      width: w,
+      height: h,
+      texelSizeX: fbo1.texelSizeX,
+      texelSizeY: fbo1.texelSizeY,
+      get read() { return fbo1; },
+      get write() { return fbo2; },
+      swap: function() { var tmp = fbo1; fbo1 = fbo2; fbo2 = tmp; }
+    };
+  }
+
+  function fluidGetResolution(resolution) {
+    var aspectRatio = fgl.drawingBufferWidth / fgl.drawingBufferHeight;
+    if (aspectRatio < 1) aspectRatio = 1.0 / aspectRatio;
+    var min = Math.round(resolution);
+    var max = Math.round(resolution * aspectRatio);
+    if (max > fMaxTextureSize) {
+      min = Math.max(2, Math.floor(min * fMaxTextureSize / max));
+      max = fMaxTextureSize;
+    }
+    if (fgl.drawingBufferWidth > fgl.drawingBufferHeight) return { width: max, height: min };
+    return { width: min, height: max };
+  }
+
+  function fluidInitFramebuffers() {
+    var simRes = fluidGetResolution(cfg.SIM_RESOLUTION);
+    var dyeRes = fluidGetResolution(cfg.DYE_RESOLUTION);
+    var texType = fHalfFloatType;
+    var filtering = fLinearFiltering ? fgl.LINEAR : fgl.NEAREST;
+
+    fgl.disable(fgl.BLEND);
+
+    fDye = fluidCreateDoubleFBO(dyeRes.width, dyeRes.height, fFormatRGBA.internalFormat, fFormatRGBA.format, texType, filtering);
+    fVelocity = fluidCreateDoubleFBO(simRes.width, simRes.height, fFormatRG.internalFormat, fFormatRG.format, texType, filtering);
+    fDivergence = fluidCreateFBO(simRes.width, simRes.height, fFormatR.internalFormat, fFormatR.format, texType, fgl.NEAREST);
+    fCurl = fluidCreateFBO(simRes.width, simRes.height, fFormatR.internalFormat, fFormatR.format, texType, fgl.NEAREST);
+    fPressure = fluidCreateDoubleFBO(simRes.width, simRes.height, fFormatR.internalFormat, fFormatR.format, texType, fgl.NEAREST);
+
+    var bloomRes = fluidGetResolution(cfg.BLOOM_RESOLUTION);
+    fBloom = fluidCreateFBO(bloomRes.width, bloomRes.height, fFormatRGBA.internalFormat, fFormatRGBA.format, texType, filtering);
+    fBloomFBOs.length = 0;
+    for (var i = 0; i < cfg.BLOOM_ITERATIONS; i++) {
+      var bw = bloomRes.width >> (i + 1);
+      var bh = bloomRes.height >> (i + 1);
+      if (bw < 2 || bh < 2) break;
+      fBloomFBOs.push(fluidCreateFBO(bw, bh, fFormatRGBA.internalFormat, fFormatRGBA.format, texType, filtering));
+    }
+  }
+
+  // -- Aspect corrections (canvas is 16:9, texcoord space is square) --
+
+  function fluidCorrectRadius(radius) {
+    var aspectRatio = fCanvas.width / fCanvas.height;
+    if (aspectRatio > 1) radius *= aspectRatio;
+    return radius;
+  }
+
+  function fluidCorrectDeltaX(delta) {
+    var aspectRatio = fCanvas.width / fCanvas.height;
+    if (aspectRatio < 1) delta *= aspectRatio;
+    return delta;
+  }
+
+  function fluidCorrectDeltaY(delta) {
+    var aspectRatio = fCanvas.width / fCanvas.height;
+    if (aspectRatio > 1) delta /= aspectRatio;
+    return delta;
+  }
+
+  // -- Splat queue --
+
+  // wx/wy in WORLD pixels (y-down); dvxPx/dvyPx in px/frame (y-down); color
+  // {r,g,b} in 0..1 (may exceed 1 for HDR bloom pop); radiusScale multiplies
+  // cfg.SPLAT_RADIUS; opts.velocityOnly skips dye, opts.priority = burst.
+  function fluidSplat(wx, wy, dvxPx, dvyPx, color, radiusScale, opts) {
+    if (!fluid.ready) return;
+    fPending.push({
+      tx: wx / WORLD_W,
+      ty: 1.0 - wy / WORLD_H,
+      dx: fluidCorrectDeltaX(dvxPx / WORLD_W) * cfg.FORCE,
+      dy: fluidCorrectDeltaY(-dvyPx / WORLD_H) * cfg.FORCE,
+      color: color || { r: 1, g: 0.65, b: 0.3 },
+      radiusScale: (typeof radiusScale === 'number') ? radiusScale : 1,
+      velocityOnly: !!(opts && opts.velocityOnly),
+      priority: !!(opts && opts.priority)
+    });
+  }
+
+  function fluidApplySplat(s) {
+    var p = fPrograms.splat;
+    p.bind();
+    fgl.uniform2f(p.uniforms.texelSize, fVelocity.texelSizeX, fVelocity.texelSizeY);
+    fgl.uniform1i(p.uniforms.uTarget, fVelocity.read.attach(0));
+    fgl.uniform1f(p.uniforms.aspectRatio, fCanvas.width / fCanvas.height);
+    fgl.uniform2f(p.uniforms.point, s.tx, s.ty);
+    fgl.uniform3f(p.uniforms.color, s.dx, s.dy, 0.0);
+    fgl.uniform1f(p.uniforms.radius, fluidCorrectRadius(cfg.SPLAT_RADIUS * s.radiusScale / 100.0));
+    fluidBlit(fVelocity.write);
+    fVelocity.swap();
+
+    if (!s.velocityOnly) {
+      fgl.uniform1i(p.uniforms.uTarget, fDye.read.attach(0));
+      fgl.uniform3f(p.uniforms.color, s.color.r, s.color.g, s.color.b);
+      fluidBlit(fDye.write);
+      fDye.swap();
+    }
+    fluid._splatCount++;
+  }
+
+  function fluidFlushPending() {
+    if (!fPending.length) return;
+    fgl.disable(fgl.BLEND);
+    var applied = 0;
+    var i, s;
+    // Pass 1: bursts jump the queue and are never dropped (still count against budget)
+    for (i = 0; i < fPending.length; i++) {
+      s = fPending[i];
+      if (s.priority) { fluidApplySplat(s); applied++; }
+    }
+    // Pass 2: dye splats, within remaining budget
+    for (i = 0; i < fPending.length; i++) {
+      s = fPending[i];
+      if (!s.priority && !s.velocityOnly && applied < FLUID_SPLAT_BUDGET) { fluidApplySplat(s); applied++; }
+    }
+    // Pass 3: velocity-only splats are dropped first when over budget
+    for (i = 0; i < fPending.length; i++) {
+      s = fPending[i];
+      if (!s.priority && s.velocityOnly && applied < FLUID_SPLAT_BUDGET) { fluidApplySplat(s); applied++; }
+    }
+    fPending.length = 0;
+  }
+
+  // Explosion: central dye + white-hot core + 8 radial velocity splats.
+  function fluidBurst(wx, wy, radiusPx, color) {
+    fluid._burstCount++;
+    if (!fluid.ready) return;
+    var rr = (typeof radiusPx === 'number' && isFinite(radiusPx) && radiusPx > 0) ? radiusPx : 200;
+    var scale = Math.min(Math.max(rr / 200, 0.5), 3.5);
+    var c = color || { r: 1, g: 0.65, b: 0.3 };
+    // Central dye splat at HDR intensity (pops through the bloom threshold)
+    fluidSplat(wx, wy, 0, 0, { r: c.r * 0.9 * scale, g: c.g * 0.9 * scale, b: c.b * 0.9 * scale }, 3.0 * scale, { priority: true });
+    // White-hot core
+    fluidSplat(wx, wy, 0, 0, { r: 1.2 * 0.5 * scale, g: 1.1 * 0.5 * scale, b: 0.9 * 0.5 * scale }, 1.1 * scale, { priority: true });
+    // Base hue for the multi-colored shockwave ring; achromatic colors
+    // (white player-death bursts) get a full rainbow ring instead
+    var mx = Math.max(c.r, c.g, c.b), mn = Math.min(c.r, c.g, c.b);
+    var d = mx - mn, baseHue = 0, achromatic = d < 0.05 * mx || mx <= 0;
+    if (!achromatic) {
+      if (mx === c.r) baseHue = ((c.g - c.b) / d + 6) % 6;
+      else if (mx === c.g) baseHue = (c.b - c.r) / d + 2;
+      else baseHue = (c.r - c.g) / d + 4;
+      baseHue /= 6;
+    }
+    // 8 radial shockwave splats, each carrying a hue-shifted dab of dye so the
+    // swirl smears the ring into multi-colored wisps
+    var ringR = rr * 0.45;
+    for (var k = 0; k < 8; k++) {
+      var a = k * Math.PI / 4;
+      var ca = Math.cos(a), sa = Math.sin(a);
+      var hk = achromatic ? k / 8 : (baseHue + (k / 8 - 0.5) * 0.24 + 1) % 1;
+      var rc = fluidHSVtoRGB(hk, 0.85, 1.0);
+      fluidSplat(wx + ca * ringR, wy + sa * ringR, ca * 20 * scale, sa * 20 * scale,
+        { r: rc.r * 0.35 * scale, g: rc.g * 0.35 * scale, b: rc.b * 0.35 * scale },
+        1.5 * scale, { priority: true });
+    }
+  }
+
+  // -- Colors --
+
+  function fluidHSVtoRGB(h, s, v) {
+    var r, g, b;
+    var i = Math.floor(h * 6);
+    var f = h * 6 - i;
+    var p = v * (1 - s);
+    var q = v * (1 - f * s);
+    var t = v * (1 - (1 - f) * s);
+    switch (i % 6) {
+      case 0: r = v; g = t; b = p; break;
+      case 1: r = q; g = v; b = p; break;
+      case 2: r = p; g = v; b = t; break;
+      case 3: r = p; g = q; b = v; break;
+      case 4: r = t; g = p; b = v; break;
+      default: r = v; g = p; b = q; break;
+    }
+    return { r: r, g: g, b: b };
+  }
+
+  // Game colors arrive as '#rgb', '#rrggbb' or 'rgba(r,g,b,a)'; unknown -> warm default.
+  function fluidHexToRgbF(cssColor) {
+    if (typeof cssColor === 'string') {
+      var str = cssColor.trim();
+      if (str.charAt(0) === '#') {
+        var hex = str.slice(1);
+        if (hex.length === 3) {
+          hex = hex.charAt(0) + hex.charAt(0) + hex.charAt(1) + hex.charAt(1) + hex.charAt(2) + hex.charAt(2);
+        }
+        if (hex.length === 6) {
+          var n = parseInt(hex, 16);
+          if (!isNaN(n)) {
+            return { r: ((n >> 16) & 255) / 255, g: ((n >> 8) & 255) / 255, b: (n & 255) / 255 };
+          }
+        }
+      } else {
+        var m = str.match(/^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/);
+        if (m) {
+          return {
+            r: Math.min(parseFloat(m[1]), 255) / 255,
+            g: Math.min(parseFloat(m[2]), 255) / 255,
+            b: Math.min(parseFloat(m[3]), 255) / 255
+          };
+        }
+      }
+    }
+    return { r: 1, g: 0.65, b: 0.3 };
+  }
+
+  // -- Ambient nebula life --
+
+  function fluidAmbientColor(intensity) {
+    // Slowly drifting deep-space hue: teal -> blue -> purple -> magenta and back
+    var hue = 0.45 + 0.4 * (0.5 + 0.5 * Math.sin(fHueDrift * Math.PI * 2));
+    hue += (Math.random() - 0.5) * 0.06;
+    if (hue < 0.45) hue = 0.45;
+    if (hue > 0.85) hue = 0.85;
+    var c = fluidHSVtoRGB(hue, 0.9, 1.0);
+    return { r: c.r * intensity, g: c.g * intensity, b: c.b * intensity };
+  }
+
+  function fluidEmitAmbient(count) {
+    for (var i = 0; i < count; i++) {
+      var intensity = 0.10 + Math.random() * 0.08;
+      var ang = Math.random() * Math.PI * 2;
+      var force = 0.5 + Math.random() * 1.0;  // well under a ship stir's force
+      fluidSplat(
+        Math.random() * WORLD_W,
+        Math.random() * WORLD_H,
+        Math.cos(ang) * force,
+        Math.sin(ang) * force,
+        fluidAmbientColor(intensity),
+        2.5 + Math.random() * 2.5,
+        null
+      );
+    }
+  }
+
+  // -- Simulation step --
+
+  function fluidStep(dt) {
+    var p = fPrograms;
+    fgl.disable(fgl.BLEND);
+
+    p.curl.bind();
+    fgl.uniform2f(p.curl.uniforms.texelSize, fVelocity.texelSizeX, fVelocity.texelSizeY);
+    fgl.uniform1i(p.curl.uniforms.uVelocity, fVelocity.read.attach(0));
+    fluidBlit(fCurl);
+
+    p.vorticity.bind();
+    fgl.uniform2f(p.vorticity.uniforms.texelSize, fVelocity.texelSizeX, fVelocity.texelSizeY);
+    fgl.uniform1i(p.vorticity.uniforms.uVelocity, fVelocity.read.attach(0));
+    fgl.uniform1i(p.vorticity.uniforms.uCurl, fCurl.attach(1));
+    fgl.uniform1f(p.vorticity.uniforms.curl, cfg.CURL);
+    fgl.uniform1f(p.vorticity.uniforms.dt, dt);
+    fluidBlit(fVelocity.write);
+    fVelocity.swap();
+
+    p.divergence.bind();
+    fgl.uniform2f(p.divergence.uniforms.texelSize, fVelocity.texelSizeX, fVelocity.texelSizeY);
+    fgl.uniform1i(p.divergence.uniforms.uVelocity, fVelocity.read.attach(0));
+    fluidBlit(fDivergence);
+
+    p.clear.bind();
+    fgl.uniform2f(p.clear.uniforms.texelSize, fPressure.texelSizeX, fPressure.texelSizeY);
+    fgl.uniform1i(p.clear.uniforms.uTexture, fPressure.read.attach(0));
+    fgl.uniform1f(p.clear.uniforms.value, cfg.PRESSURE);
+    fluidBlit(fPressure.write);
+    fPressure.swap();
+
+    p.pressure.bind();
+    fgl.uniform2f(p.pressure.uniforms.texelSize, fVelocity.texelSizeX, fVelocity.texelSizeY);
+    fgl.uniform1i(p.pressure.uniforms.uDivergence, fDivergence.attach(0));
+    for (var i = 0; i < cfg.PRESSURE_ITERATIONS; i++) {
+      fgl.uniform1i(p.pressure.uniforms.uPressure, fPressure.read.attach(1));
+      fluidBlit(fPressure.write);
+      fPressure.swap();
+    }
+
+    p.gradSub.bind();
+    fgl.uniform2f(p.gradSub.uniforms.texelSize, fVelocity.texelSizeX, fVelocity.texelSizeY);
+    fgl.uniform1i(p.gradSub.uniforms.uPressure, fPressure.read.attach(0));
+    fgl.uniform1i(p.gradSub.uniforms.uVelocity, fVelocity.read.attach(1));
+    fluidBlit(fVelocity.write);
+    fVelocity.swap();
+
+    p.advection.bind();
+    fgl.uniform2f(p.advection.uniforms.texelSize, fVelocity.texelSizeX, fVelocity.texelSizeY);
+    if (!fLinearFiltering) {
+      fgl.uniform2f(p.advection.uniforms.dyeTexelSize, fVelocity.texelSizeX, fVelocity.texelSizeY);
+    }
+    fgl.uniform1i(p.advection.uniforms.uVelocity, fVelocity.read.attach(0));
+    fgl.uniform1i(p.advection.uniforms.uSource, fVelocity.read.attach(0));
+    fgl.uniform1f(p.advection.uniforms.dt, dt);
+    fgl.uniform1f(p.advection.uniforms.dissipation, cfg.VELOCITY_DISSIPATION);
+    fluidBlit(fVelocity.write);
+    fVelocity.swap();
+
+    if (!fLinearFiltering) {
+      fgl.uniform2f(p.advection.uniforms.dyeTexelSize, fDye.texelSizeX, fDye.texelSizeY);
+    }
+    fgl.uniform1i(p.advection.uniforms.uVelocity, fVelocity.read.attach(0));
+    fgl.uniform1i(p.advection.uniforms.uSource, fDye.read.attach(1));
+    fgl.uniform1f(p.advection.uniforms.dissipation, cfg.DENSITY_DISSIPATION);
+    fluidBlit(fDye.write);
+    fDye.swap();
+  }
+
+  // -- Public per-frame entry points --
+
+  function fluidUpdate(dtSec) {
+    if (!fluid.ready) return;
+    var dt = (typeof dtSec === 'number' && isFinite(dtSec) && dtSec > 0) ? dtSec : 1 / 60;
+    if (dt > 1 / 30) dt = 1 / 30;  // backgrounded-tab / frame-hitch clamp
+
+    fHueDrift = (fHueDrift + dt * 0.01) % 1;
+    if (cfg.AMBIENT) {  // checked every update — false means zero ambient splats
+      fAmbientTimer += dt;
+      if (fAmbientTimer >= fAmbientInterval) {
+        fAmbientTimer = 0;
+        fAmbientInterval = 4 + Math.random() * 3;
+        fluidEmitAmbient(1 + Math.floor(Math.random() * 2));
+      }
+    }
+    fluidFlushPending();
+    // Sim time scale slows the fluid physics only — splat input and ambient
+    // cadence stay on real time
+    fluidStep(dt * (cfg.TIME_SCALE > 0 ? cfg.TIME_SCALE : 1));
+  }
+
+  function fluidRender() {
+    if (!fluid.ready) return;
+    if (cfg.BLOOM) fluidApplyBloom(fDye.read, fBloom);
+
+    fgl.bindFramebuffer(fgl.FRAMEBUFFER, null);
+    fgl.viewport(0, 0, fgl.drawingBufferWidth, fgl.drawingBufferHeight);
+    fgl.disable(fgl.BLEND);
+    fgl.clearColor(0, 0, 0, 0);  // transparent — composited over the starfield canvas
+    fgl.clear(fgl.COLOR_BUFFER_BIT);
+    fgl.enable(fgl.BLEND);
+    fgl.blendFunc(fgl.ONE, fgl.ONE_MINUS_SRC_ALPHA);
+
+    var p = fPrograms.display;
+    p.bind();
+    fgl.uniform2f(p.uniforms.texelSize, fDye.texelSizeX, fDye.texelSizeY);
+    fgl.uniform1i(p.uniforms.uTexture, fDye.read.attach(0));
+    fgl.uniform1i(p.uniforms.uBloom, fBloom.attach(1));
+    fgl.uniform1i(p.uniforms.uShading, cfg.SHADING ? 1 : 0);
+    fgl.uniform1i(p.uniforms.uBloomEnabled, cfg.BLOOM ? 1 : 0);
+    fluidBlit(null);
+    fgl.disable(fgl.BLEND);
+  }
+
+  function fluidApplyBloom(source, destination) {
+    if (fBloomFBOs.length < 2) return;
+
+    fgl.disable(fgl.BLEND);
+
+    var knee = cfg.BLOOM_THRESHOLD * cfg.BLOOM_SOFT_KNEE + 0.0001;
+    var curve0 = cfg.BLOOM_THRESHOLD - knee;
+    var curve1 = knee * 2;
+    var curve2 = 0.25 / knee;
+    var p = fPrograms;
+    p.bloomPrefilter.bind();
+    fgl.uniform3f(p.bloomPrefilter.uniforms.curve, curve0, curve1, curve2);
+    fgl.uniform1f(p.bloomPrefilter.uniforms.threshold, cfg.BLOOM_THRESHOLD);
+    fgl.uniform1i(p.bloomPrefilter.uniforms.uTexture, source.attach(0));
+    var last = destination;
+    fluidBlit(last);
+
+    p.bloomBlur.bind();
+    for (var i = 0; i < fBloomFBOs.length; i++) {
+      var dest = fBloomFBOs[i];
+      fgl.uniform2f(p.bloomBlur.uniforms.texelSize, last.texelSizeX, last.texelSizeY);
+      fgl.uniform1i(p.bloomBlur.uniforms.uTexture, last.attach(0));
+      fluidBlit(dest);
+      last = dest;
+    }
+
+    fgl.blendFunc(fgl.ONE, fgl.ONE);
+    fgl.enable(fgl.BLEND);
+    for (var j = fBloomFBOs.length - 2; j >= 0; j--) {
+      var baseTex = fBloomFBOs[j];
+      fgl.uniform2f(p.bloomBlur.uniforms.texelSize, last.texelSizeX, last.texelSizeY);
+      fgl.uniform1i(p.bloomBlur.uniforms.uTexture, last.attach(0));
+      fluidBlit(baseTex);
+      last = baseTex;
+    }
+    fgl.disable(fgl.BLEND);
+
+    p.bloomFinal.bind();
+    fgl.uniform2f(p.bloomFinal.uniforms.texelSize, last.texelSizeX, last.texelSizeY);
+    fgl.uniform1i(p.bloomFinal.uniforms.uTexture, last.attach(0));
+    fgl.uniform1f(p.bloomFinal.uniforms.intensity, cfg.BLOOM_INTENSITY);
+    fluidBlit(destination);
+  }
+
+  // -- Init / teardown --
+
+  function fluidAbortInit() {
+    fluid.ready = false;
+    fluid.canvas = null;
+    fgl = null;
+    fCanvas = null;
+    fPrograms = null;
+    return false;
+  }
+
+  function fluidInit() {
+    if (fluid.ready) return true;
+    try {
+      var w = Math.floor(WORLD_W * 0.5);
+      var h = Math.floor(WORLD_H * 0.5);
+      fCanvas = document.createElement('canvas');
+      fCanvas.width = w;
+      fCanvas.height = h;
+      // preserveDrawingBuffer so the canvas can be drawImage'd after the
+      // render pass returns (same pattern as _plasma).
+      var glParams = { alpha: true, depth: false, stencil: false, antialias: false, preserveDrawingBuffer: true };
+      fgl = fCanvas.getContext('webgl2', glParams);
+      fIsWebGL2 = !!fgl;
+      if (!fgl) fgl = fCanvas.getContext('webgl', glParams) || fCanvas.getContext('experimental-webgl', glParams);
+      if (!fgl) return fluidAbortInit();
+
+      // Capability detection: half-float render targets are required
+      fHalfFloatType = null;
+      fLinearFiltering = false;
+      if (fIsWebGL2) {
+        fgl.getExtension('EXT_color_buffer_float');
+        fgl.getExtension('EXT_color_buffer_half_float');
+        fHalfFloatType = fgl.HALF_FLOAT;
+        fLinearFiltering = true;  // half-float linear filtering is core in WebGL2
+      } else {
+        var halfFloat = fgl.getExtension('OES_texture_half_float');
+        if (halfFloat) {
+          fHalfFloatType = halfFloat.HALF_FLOAT_OES;
+          fLinearFiltering = !!fgl.getExtension('OES_texture_half_float_linear');
+        } else if (fgl.getExtension('OES_texture_float')) {
+          fHalfFloatType = fgl.FLOAT;
+          fLinearFiltering = !!fgl.getExtension('OES_texture_float_linear');
+        }
+      }
+      if (fHalfFloatType === null) return fluidAbortInit();
+
+      fMaxTextureSize = fgl.getParameter(fgl.MAX_TEXTURE_SIZE);
+      if (fIsWebGL2) {
+        fFormatRGBA = fluidGetSupportedFormat(fgl.RGBA16F, fgl.RGBA, fHalfFloatType);
+        fFormatRG = fluidGetSupportedFormat(fgl.RG16F, fgl.RG, fHalfFloatType);
+        fFormatR = fluidGetSupportedFormat(fgl.R16F, fgl.RED, fHalfFloatType);
+      } else {
+        fFormatRGBA = fluidGetSupportedFormat(fgl.RGBA, fgl.RGBA, fHalfFloatType);
+        fFormatRG = fFormatRGBA;
+        fFormatR = fFormatRGBA;
+      }
+      if (!fFormatRGBA || !fFormatRG || !fFormatR) return fluidAbortInit();
+
+      // Fullscreen quad (attrib 0 = aPosition; context is exclusive so the
+      // binding persists for every pass)
+      var vertBuf = fgl.createBuffer();
+      fgl.bindBuffer(fgl.ARRAY_BUFFER, vertBuf);
+      fgl.bufferData(fgl.ARRAY_BUFFER, new Float32Array([-1, -1, -1, 1, 1, 1, 1, -1]), fgl.STATIC_DRAW);
+      var elemBuf = fgl.createBuffer();
+      fgl.bindBuffer(fgl.ELEMENT_ARRAY_BUFFER, elemBuf);
+      fgl.bufferData(fgl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 0, 2, 3]), fgl.STATIC_DRAW);
+      fgl.vertexAttribPointer(0, 2, fgl.FLOAT, false, 0, 0);
+      fgl.enableVertexAttribArray(0);
+
+      var filteringKeywords = fLinearFiltering ? null : ['MANUAL_FILTERING'];
+      var baseVertex = fluidCompileShader(fgl.VERTEX_SHADER, FLUID_VERT);
+      fPrograms = {
+        clear: fluidMakeProgram(baseVertex, FLUID_CLEAR_FRAG),
+        splat: fluidMakeProgram(baseVertex, FLUID_SPLAT_FRAG),
+        advection: fluidMakeProgram(baseVertex, FLUID_ADVECTION_FRAG, filteringKeywords),
+        divergence: fluidMakeProgram(baseVertex, FLUID_DIVERGENCE_FRAG),
+        curl: fluidMakeProgram(baseVertex, FLUID_CURL_FRAG),
+        vorticity: fluidMakeProgram(baseVertex, FLUID_VORTICITY_FRAG),
+        pressure: fluidMakeProgram(baseVertex, FLUID_PRESSURE_FRAG),
+        gradSub: fluidMakeProgram(baseVertex, FLUID_GRADSUB_FRAG),
+        bloomPrefilter: fluidMakeProgram(baseVertex, FLUID_BLOOM_PREFILTER_FRAG),
+        bloomBlur: fluidMakeProgram(baseVertex, FLUID_BLOOM_BLUR_FRAG),
+        bloomFinal: fluidMakeProgram(baseVertex, FLUID_BLOOM_FINAL_FRAG),
+        display: fluidMakeProgram(baseVertex, FLUID_DISPLAY_FRAG)
+      };
+
+      fluidInitFramebuffers();
+
+      fluid.canvas = fCanvas;
+      fluid.ready = true;
+
+      // Seed the nebula once at init (runs regardless of cfg.AMBIENT, by design)
+      fluidEmitAmbient(8 + Math.floor(Math.random() * 5));
+      fluidFlushPending();
+      return true;
+    } catch (e) {
+      return fluidAbortInit();
+    }
+  }
+
+  return fluid;
+})();
+
+// === SECTION: Fluid Game Coupling ===
+// Bridges gameState into the fluid nebula each frame (called from sfDraw on
+// the fluid path only): ship stir/wake splats, drift + void-drift paint,
+// corvette/carrier stirs, and one-shot explosion bursts. Reads host AND guest
+// (interpolated) snapshots, so every field access is guarded; no-op pre-game
+// (empty players array) and when the fluid isn't ready.
+var _fluidPrevPos = new Map();   // playerId -> {x, y} previous-frame position
+var _fluidSeenZones = new Set(); // explosion-zone keys already burst (each zone bursts exactly once)
+
+function _fluidZoneKey(z) {
+    return (z.id !== undefined && z.id !== null) ? z.id : (Math.round(z.x) + '|' + Math.round(z.y));
+}
+
+// Minimal full-saturation HSV hue -> RGB, scaled by dye intensity (drift rainbow trail)
+function _fluidHueColor(h, intensity) {
+    var i = Math.floor(h * 6), f = h * 6 - i, q = 1 - f;
+    var r, g, b;
+    switch (i % 6) {
+        case 0: r = 1; g = f; b = 0; break;
+        case 1: r = q; g = 1; b = 0; break;
+        case 2: r = 0; g = 1; b = f; break;
+        case 3: r = 0; g = q; b = 1; break;
+        case 4: r = f; g = 0; b = 1; break;
+        default: r = 1; g = 0; b = q; break;
+    }
+    return { r: r * intensity, g: g * intensity, b: b * intensity };
+}
+
+function _fluidCoupling() {
+    if (!window._fluid || !_fluid.ready) return;
+    if (typeof gameState === 'undefined' || !gameState) return;
+    var now = performance.now();
+
+    // -- Ships: velocity from per-frame position deltas (works on host and on
+    //    guest interpolated snapshots; never relies on glideVx existing) --
+    var players = gameState.players || [];
+    for (var i = 0; i < players.length; i++) {
+        var p = players[i];
+        if (!p || !p.alive) continue;
+        var key = p.playerId || ('p' + i);
+        var prev = _fluidPrevPos.get(key);
+        if (!prev) {
+            // First sighting: record position only — no delta yet, no splat
+            _fluidPrevPos.set(key, { x: p.x, y: p.y });
+            continue;
+        }
+        var vx = p.x - prev.x;
+        var vy = p.y - prev.y;
+        prev.x = p.x;
+        prev.y = p.y;
+        var speed = Math.sqrt(vx * vx + vy * vy);
+        // Respawn/teleport jump: update prev only, never splat across it
+        if (speed > 60) continue;
+        // A stationary ship emits ZERO splats regardless of drift flags
+        if (speed <= 0.3) continue;
+        // Velocity-only stir wherever the ship moves: the ship parts and swirls
+        // the existing nebula but never adds dye — continuous dye injection
+        // accumulates into a ship-obscuring HDR blob within seconds
+        _fluid.splat(p.x, p.y, vx, vy, null, 0.5, { velocityOnly: true });
+        if (p.drifting || p.voidDrifting) {
+            // Drift ink is distance-gated, not per-frame: one dab per ~16px of
+            // travel, so slow drifts and tight circles can't stack overlapping
+            // splats into a bright blob
+            var pdx = p.x - (prev.paintX !== undefined ? prev.paintX : p.x - 999);
+            var pdy = p.y - (prev.paintY !== undefined ? prev.paintY : 0);
+            if (pdx * pdx + pdy * pdy >= 256) {
+                prev.paintX = p.x;
+                prev.paintY = p.y;
+                if (p.voidDrifting) {
+                    // Void drift (L10): faint violet-white ink, strong stir
+                    _fluid.splat(p.x, p.y, vx * 1.6, vy * 1.6,
+                        { r: 0.55 * 0.12, g: 0.35 * 0.12, b: 0.9 * 0.12 }, 1.1, null);
+                } else {
+                    // Drift paint: subtle rainbow trail, hue cycles over time and per player
+                    _fluid.splat(p.x, p.y, vx * 1.2, vy * 1.2,
+                        _fluidHueColor((now * 0.00012 + i * 0.3) % 1, 0.04), 0.9, null);
+                }
+            }
+        }
+    }
+    // Prune prev-pos entries for departed players. Entries only exist for keys
+    // seen in the loop above, so size > players.length iff stale keys remain.
+    if (_fluidPrevPos.size > players.length) {
+        var livePlayers = {};
+        for (var pi = 0; pi < players.length; pi++) {
+            if (players[pi]) livePlayers[players[pi].playerId || ('p' + pi)] = true;
+        }
+        _fluidPrevPos.forEach(function(v, k) {
+            if (!livePlayers[k]) _fluidPrevPos.delete(k);
+        });
+    }
+
+    // -- Large enemies stir the nebula (vx/vy are serialized, so guests see this too) --
+    var enemies = gameState.enemies || [];
+    for (var ei = 0; ei < enemies.length; ei++) {
+        var e = enemies[ei];
+        if (!e || !e.alive) continue;
+        if (e.type !== 'corvette') continue;
+        if (typeof e.vx !== 'number' || typeof e.vy !== 'number') continue;
+        var es = Math.sqrt(e.vx * e.vx + e.vy * e.vy);
+        if (es <= 0.3 || es > 60) continue;
+        _fluid.splat(e.x, e.y, e.vx * 0.5, e.vy * 0.5, null, 1.5, { velocityOnly: true });
+    }
+
+    // -- Carriers live in their own array (no type field) and stir the same way --
+    var carriers = gameState.carriers || [];
+    for (var ci = 0; ci < carriers.length; ci++) {
+        var car = carriers[ci];
+        if (!car || !car.alive) continue;
+        if (typeof car.vx !== 'number' || typeof car.vy !== 'number') continue;
+        var cs = Math.sqrt(car.vx * car.vx + car.vy * car.vy);
+        if (cs <= 0.3 || cs > 60) continue;
+        _fluid.splat(car.x, car.y, car.vx * 0.5, car.vy * 0.5, null, 1.5, { velocityOnly: true });
+    }
+
+    // -- Explosion zones burst exactly once (the Set de-dupes while a zone
+    //    expands/fades over its multi-second lifetime) --
+    var zones = gameState.explosionZones || [];
+    for (var zi = 0; zi < zones.length; zi++) {
+        var z = zones[zi];
+        if (!z) continue;
+        var zkey = _fluidZoneKey(z);
+        if (_fluidSeenZones.has(zkey)) continue;
+        _fluidSeenZones.add(zkey);
+        _fluid.burst(z.x, z.y, z.maxRadius || z.currentRadius * 3, _fluid.hexToRgbF(z.color));
+    }
+    // Prune keys whose zones no longer exist. After the add pass above the Set
+    // is a superset of the live keys, so size > zones.length iff stale keys remain.
+    if (_fluidSeenZones.size > zones.length) {
+        var live = {};
+        for (var li = 0; li < zones.length; li++) {
+            if (zones[li]) live[_fluidZoneKey(zones[li])] = true;
+        }
+        _fluidSeenZones.forEach(function(k) {
+            if (!live[k]) _fluidSeenZones.delete(k);
+        });
+    }
 }
 
 // === SECTION: Glow Sprite Cache ===
@@ -1196,7 +2325,7 @@ function finalExplodeEnemy(e) {
     sfxExplosion(e.x, e.y, 0.5);
     explodeEnemy(e.x, e.y, e.color);
     tryDropShield(e.x, e.y);
-    addExplosionZone(e.x, e.y, 120);
+    addExplosionZone(e.x, e.y, 120, e.color);
 
     // AoE damage from explosion
     var aoeRadius = e.radius * 3;
@@ -1457,7 +2586,7 @@ function explodePlayer(x, y) {
     spawnRingWave(x, y, 100, 6, '#00FFFF');
     spawnRingWave(x, y, 60, 7, '#FFFFFF');
     // AoE explosion zone
-    addExplosionZone(x, y, 200);
+    addExplosionZone(x, y, 200, '#ffffff');
 }
 
 function warpEffect(x, y, phase) {
@@ -1493,9 +2622,10 @@ function warpEffect(x, y, phase) {
     }
 }
 
-function addExplosionZone(x, y, maxRadius) {
+function addExplosionZone(x, y, maxRadius, color) {
     var mr = maxRadius || 120;
     gameState.explosionZones.push({
+        id: nextId(),
         x, y,
         maxRadius: mr,
         expandSpeed: 6,
@@ -1504,6 +2634,7 @@ function addExplosionZone(x, y, maxRadius) {
         fadeDuration: 2500,
         strength: 1.0,
         createdTime: gameState.time,
+        color: color || '#ffaa66',
     });
 }
 
@@ -2496,7 +3627,7 @@ function updateCarriers(dt) {
                 if (progress > 0.25) spawnRingWave(boomX, boomY, rand(25, 50), rand(3, 5), '#FFFFFF');
                 gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, rand(6, 16));
                 gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, rand(0.06, 0.2));
-                addExplosionZone(boomX, boomY, rand(70, 120));
+                addExplosionZone(boomX, boomY, rand(70, 120), '#ffa040');
             }
         }
 
@@ -2504,7 +3635,7 @@ function updateCarriers(dt) {
         if (progress >= 0.5 && c.chunks.length === 0) {
             gameState.screenFlashAlpha = 0.6;
             gameState.screenShake.intensity = 40;
-            addExplosionZone(c.x, c.y, 220);
+            addExplosionZone(c.x, c.y, 220, '#ffa040');
             spawnRingWave(c.x, c.y, 180, 3, '#FF4400');
             spawnRingWave(c.x, c.y, 140, 4, '#FFFFFF');
             spawnRingWave(c.x, c.y, 100, 5, '#FF8800');
@@ -2646,7 +3777,7 @@ function updateCarriers(dt) {
                     }
                     spawnRingWave(ch.x, ch.y, rand(60, 100), rand(3, 5), '#FF4400');
                     spawnRingWave(ch.x, ch.y, rand(40, 70), rand(4, 6), '#FFFFFF');
-                    addExplosionZone(ch.x, ch.y, rand(100, 150));
+                    addExplosionZone(ch.x, ch.y, rand(100, 150), '#ffa040');
                     gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, rand(12, 22));
                     gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, rand(0.15, 0.35));
                     sfxExplosion(ch.x, ch.y, 0.7);
@@ -2666,7 +3797,7 @@ function updateCarriers(dt) {
                 spawnRingWave(c.x, c.y, 200, 5, '#FF8800');
                 spawnRingWave(c.x, c.y, 150, 6, '#FFCC00');
                 spawnRingWave(c.x, c.y, 100, 7, '#FFFFFF');
-                addExplosionZone(c.x, c.y, 350);
+                addExplosionZone(c.x, c.y, 350, '#ffa040');
                 carrierAoE(c.x, c.y, 200);
                 // Final particle supernova — wall of fire
                 var novaCount = budgetCount(100, 200);
@@ -3197,7 +4328,7 @@ function updateEnemies(dt) {
                         }
                         spawnRingWave(cc.x, cc.y, rand(40, 70), rand(3, 5), e.color);
                         spawnRingWave(cc.x, cc.y, rand(25, 45), rand(4, 6), '#FFFFFF');
-                        addExplosionZone(cc.x, cc.y, rand(50, 80));
+                        addExplosionZone(cc.x, cc.y, rand(50, 80), e.color);
                         gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, rand(8, 14));
                         gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, rand(0.1, 0.2));
                         sfxExplosion(cc.x, cc.y, 0.5);
@@ -3210,7 +4341,7 @@ function updateEnemies(dt) {
                     gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 25);
                     spawnRingWave(e.x, e.y, rand(100, 150), rand(3, 5), e.color);
                     spawnRingWave(e.x, e.y, rand(70, 110), rand(4, 6), '#FFFFFF');
-                    addExplosionZone(e.x, e.y, 150);
+                    addExplosionZone(e.x, e.y, 150, e.color);
                     var finCount = budgetCount(30, 60);
                     for (var fni = 0; fni < finCount; fni++) {
                         var fna = rand(0, Math.PI * 2);
@@ -3259,7 +4390,7 @@ function updateEnemies(dt) {
                     gameState.screenShake.intensity = Math.max(gameState.screenShake.intensity, 18);
                     spawnRingWave(e.x, e.y, rand(60, 90), rand(2, 4), e.color);
                     spawnRingWave(e.x, e.y, rand(40, 60), rand(3, 5), '#FFFFFF');
-                    addExplosionZone(e.x, e.y, 100);
+                    addExplosionZone(e.x, e.y, 100, e.color);
                     sfxExplosion(e.x, e.y, 0.6);
                     // Breakup burst
                     var bbCount = budgetCount(20, 40);
@@ -3742,7 +4873,7 @@ function checkCollisions() {
                 bulletImpact(b.x, b.y);
                 explodeAsteroid(a.x, a.y, a.size);
                 if (a.size === 'large' || a.size === 'medium') {
-                    addExplosionZone(a.x, a.y, a.size === 'large' ? 100 : 60);
+                    addExplosionZone(a.x, a.y, a.size === 'large' ? 100 : 60, '#c9a17a');
                 }
                 breakAsteroid(a);
                 a.alive = false;
@@ -4077,7 +5208,7 @@ function hitPlayer(p, hitX, hitY) {
         p.voidDriftCooldown = 0;
         p.voidDrifting = false;
         explodePlayer(p.x, p.y);
-        addExplosionZone(p.x, p.y, 150);
+        addExplosionZone(p.x, p.y, 150, '#ffffff');
         gameState.screenFlashAlpha = 0.25;
         gameState.screenShake.intensity = 18;
         // Player death AoE
@@ -5403,6 +6534,7 @@ function renderGame() {
             '-- RENDER (ms/frame) --',
             'total:      ' + (pd['render:total'] || '0'),
             'plasma:     ' + (pd['draw:plasma'] || '0'),
+            'fluid:      ' + (pd['draw:fluid'] || '0'),
             'starfield:  ' + (pd['draw:starfield'] || '0'),
             'asteroids:  ' + (pd['draw:asteroids'] || '0'),
             'carrier:    ' + (pd['draw:carrier'] || '0'),
@@ -5606,10 +6738,23 @@ if (!EMBED_MODE) { (function initStarfield() {
     });
   }
 
+  var sfLastTime = 0;
   function sfDraw(time) {
+    // Frame delta in seconds for the fluid sim (rAF timestamp is ms; _fluid.update clamps).
+    // First frame -> 1/60; duplicate/non-advancing timestamp -> 0 (no sim step, no coupling).
+    var dtSec = (sfLastTime > 0) ? Math.max(0, time - sfLastTime) / 1000 : 1 / 60;
+    sfLastTime = time;
     sfCtx.clearRect(0, 0, sfW, sfH);
-    // Render plasma then draw it as background layer
-    if (_plasma.canvas && _plasma.gl) {
+    // Render fluid nebula as background layer; plasma is the automatic fallback
+    if (window._fluid && _fluid.ready) {
+      _perf.start('draw:fluid');
+      if (typeof _fluidCoupling === 'function' && dtSec > 0) _fluidCoupling();
+      _fluid.update(dtSec);
+      _fluid.render();
+      sfCtx.drawImage(_fluid.canvas, 0, 0, sfW, sfH);
+      _perf.end('draw:fluid');
+    } else if (_plasma.canvas && _plasma.gl) {
+      // Render plasma then draw it as background layer
       var ez = (typeof gameState !== 'undefined') ? gameState.explosionZones : [];
       var nz = ez.map(function(z) {
         return { x: z.x / sfW, y: 1.0 - (z.y / sfH), radius: (z.currentRadius * z.strength) / Math.max(sfW, sfH) };
@@ -5898,7 +7043,8 @@ function serializeState() {
         }),
         explosionZones: gameState.explosionZones.map(function(ez) {
             return {
-                x: ez.x, y: ez.y, currentRadius: ez.currentRadius, strength: ez.strength,
+                id: ez.id, x: ez.x, y: ez.y, currentRadius: ez.currentRadius, strength: ez.strength,
+                maxRadius: ez.maxRadius, color: ez.color,
             };
         }),
         score: gameState.score,
@@ -5964,7 +7110,7 @@ function diffAndTriggerEffects(prev, curr) {
         if (!currIds[pe.id] && (pe.alive || pe.dying)) {
             explodeEnemy(pe.x, pe.y, pe.color);
             spawnRingWave(pe.x, pe.y, 60, 3, pe.color);
-            addExplosionZone(pe.x, pe.y, 120);
+            addExplosionZone(pe.x, pe.y, 120, pe.color);
             gameState.screenFlashAlpha = Math.max(gameState.screenFlashAlpha, 0.08);
         }
     }
@@ -5976,7 +7122,7 @@ function diffAndTriggerEffects(prev, curr) {
         var pa = prev.asteroids[o];
         if (!currAstIds[pa.id] && pa.alive) {
             explodeAsteroid(pa.x, pa.y, pa.size);
-            addExplosionZone(pa.x, pa.y, pa.radius > 40 ? 100 : 60);
+            addExplosionZone(pa.x, pa.y, pa.radius > 40 ? 100 : 60, '#c9a17a');
         }
     }
 
@@ -6482,7 +7628,12 @@ wsOn('promote-to-host', function(data) {
 
 // === SECTION: Initialization ===
 function startAll() {
-    if (!EMBED_MODE) initPlasma();
+    if (!EMBED_MODE) {
+        // Prefer the WebGL fluid nebula; fall back to plasma when float-texture rendering is unavailable
+        var fluidOk = false;
+        try { fluidOk = _fluid.init(); } catch (e) { fluidOk = false; }
+        if (!fluidOk) initPlasma();
+    }
     // Game canvas setup and game loop start are deferred until socket 'role' event
 }
 
