@@ -15,9 +15,9 @@
 
 ## What is this?
 
-Void Drift is a standalone desktop space shooter with LAN multiplayer for up to 4 players. Fly through a procedural WebGL plasma nebula, fight alien fleets, unlock 10 levels of escalating abilities, and chase high scores through a combo system that rewards aggressive play.
+Void Drift is a standalone desktop space shooter with LAN multiplayer for up to 4 players. Fly through a living, GPU fluid-simulated nebula, fight alien fleets, unlock 10 levels of escalating abilities, and chase high scores through a combo system that rewards aggressive play.
 
-The signature mechanic is the **drift** -- hold left-click to decouple your movement from your aim, sliding through space while firing in any direction. At higher levels, drifting transforms from a movement tool into an offensive weapon.
+The signature mechanic is the **drift** -- hold left-click to decouple your movement from your aim, sliding through space while firing in any direction. At higher levels, drifting transforms from a movement tool into an offensive weapon. And the nebula remembers: ships carve wakes through it, drifting paints rainbow ink into it, and every explosion punches a colored shockwave through the clouds.
 
 ## Download
 
@@ -72,9 +72,18 @@ Corvettes break into burning debris chunks on death. Carriers have a 6-second mu
 
 LAN multiplayer for up to 4 players. The app runs a WebSocket server -- other players on the same network connect via browser at `http://<your-ip>:3800`. Host-client model with automatic host migration.
 
+### The Living Nebula
+
+The background is a real-time GPU fluid simulation (Stable Fluids running entirely in WebGL fragment shaders) -- and the game plays *in* it:
+
+- **Ships stir the clouds** -- every ship physically pushes the nebula aside as it flies, leaving swirling wakes
+- **Drifting paints** -- holding drift lays a rainbow ink ribbon that keeps swirling after you're gone
+- **Explosions detonate in the fluid** -- every kill fires a shockwave ring of hue-shifted dye in the dying ship's colors; carrier deaths ripple the whole screen
+- Self-seeding deep-space ambience (teal, purple, magenta) keeps the nebula alive between fights
+- Automatic fallback to the classic plasma shader on GPUs without float-texture support
+
 ### Visuals
 
-- **WebGL plasma nebula** -- procedural simplex noise background with ship repulsion and explosion displacement
 - **250-star parallax starfield** -- stars streak into speed lines based on ship velocity
 - **2000-particle system** -- massive explosions, engine trails, drift effects, fireworks
 - **CRT post-processing** -- scanlines, vignette, neon glow (CSS, zero perf cost)
@@ -96,7 +105,7 @@ LAN multiplayer for up to 4 players. The app runs a WebSocket server -- other pl
 |---|---|
 | **Desktop** | Tauri v2 (Rust + WebView) |
 | **Backend** | axum + tokio-tungstenite |
-| **Rendering** | WebGL (plasma) + Canvas 2D (starfield, game) |
+| **Rendering** | WebGL (fluid-sim nebula + bloom) + Canvas 2D (starfield, game) |
 | **Audio** | Web Audio API with spatial stereo panning |
 | **Binary size** | ~35 MB (mostly audio assets) |
 
